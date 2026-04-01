@@ -1,0 +1,42 @@
+{
+  "schools": {
+    "label": "🏫 Schools",
+    "sender_keywords": ["wcpss.net", "greenhope", "green hope"]
+  },
+  "financial": {
+    "label": "🏦 Financial",
+    "sender_keywords": ["bank", "chase", "wellsfargo", "citi", "capitalone",
+                        "discover", "amex", "americanexpress", "paypal", "venmo",
+                        "schwab", "fidelity", "vanguard", "etrade", "robinhood",
+                        "affirm", "creditkarma", "transunion", "experian", "equifax",
+                        "coinbase", "zelle"]
+  },
+  "shipping": {
+    "label": "📦 Shipping",
+    "sender_keywords": ["fedex", "ups", "usps", "amazon"]
+  },
+  "security": {
+    "label": "🔐 Security",
+    "sender_keywords": ["security", "noreply", "no-reply", "alert"]
+  },
+  "work": {
+    "label": "🏢 Work",
+    "sender_keywords": ["appdynamics", "cisco"]
+  },
+  "high_priority_keywords": [
+    "urgent", "action required", "your account", "security alert",
+    "password", "verify", "suspended", "overdue", "payment due",
+    "invoice", "statement", "refund", "receipt", "order confirmed",
+    "shipment", "delivery", "sign in", "unusual activity",
+    "green hope", "wcpss", "principal", "school"
+  ],
+  "always_important_category_hints": {
+    "schools":   ["wcpss.net", "greenhope", "green hope"],
+    "financial": ["bank", "chase", "wellsfargo", "citi", "capitalone",
+                  "discover", "amex", "paypal", "venmo", "schwab",
+                  "fidelity", "vanguard", "creditkarma", "transunion",
+                  "experian", "affirm"],
+    "work":      ["appdynamics", "cisco"],
+    "security":  ["github"]
+  }
+}

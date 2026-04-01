@@ -1,0 +1,18 @@
+[
+  {
+    "label": "🇵🇱 Onet.pl — Biznes & Wiadomości",
+    "prompt": "Odwiedź stronę onet.pl. Przejrzyj sekcje 'Wiadomości' i 'Biznes'. Zignoruj wszystkie artykuły dotyczące Rosji i Ukrainy. Skup się na sekcji Biznes. Zwróć 5-7 najważniejszych artykułów jako listę HTML. Format każdego elementu: <li><a href='URL'>TYTUŁ</a> — jedno zdanie po polsku</li>. Zwróć TYLKO blok <ul>...</ul>, nic więcej."
+  },
+  {
+    "label": "🛍️ Slickdeals — Best Deals",
+    "prompt": "Visit slickdeals.net right now. Find the top 7 hottest deals currently on the front page. Return them as an HTML list. Format each item: <li><a href='DEAL_URL'>DEAL TITLE</a> — price/discount info in one line</li>. Return ONLY the <ul>...</ul> block, nothing else."
+  },
+  {
+    "label": "🟠 Hacker News — Top Stories",
+    "prompt": "Visit news.ycombinator.com right now and return the top 7 stories as an HTML list. Format each item: <li><a href='LINK'>TITLE</a> — one sentence summary</li>. Return ONLY the <ul>...</ul> block, nothing else."
+  },
+  {
+    "label": "📈 Business Insider — Top Stories",
+    "prompt": "Visit businessinsider.com right now and find the top 7 news and business stories. Return them as an HTML list. Format each item: <li><a href='LINK'>TITLE</a> — one sentence summary</li>. Return ONLY the <ul>...</ul> block, nothing else."
+  }
+]
