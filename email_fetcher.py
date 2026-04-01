@@ -22,7 +22,7 @@ from config import (
     YANDEX_IMAP, YANDEX_USER, YANDEX_PASS,
     MUTED_SENDERS, ALWAYS_IMPORTANT, ALWAYS_IMPORTANT_HINTS,
     HIGH_PRIORITY_KEYWORDS, SCHOOL_SENDERS, CATEGORIES,
-    load_prompt,
+    load_prompt, CODEX_BIN,
 )
 
 
@@ -212,7 +212,7 @@ def triage_emails(email_list, label=""):
     try:
         out_file = tempfile.mktemp(suffix=".txt")
         subprocess.run(
-            ["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-o", out_file, "-"],
+            [CODEX_BIN, "exec", "--skip-git-repo-check", "--ephemeral", "-o", out_file, "-"],
             input=prompt, capture_output=True, text=True, timeout=180
         )
         if os.path.exists(out_file):

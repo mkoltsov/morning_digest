@@ -14,5 +14,28 @@
   {
     "label": "📈 Business Insider — Top Stories",
     "prompt": "Visit businessinsider.com right now and find the top 7 news and business stories. Return them as an HTML list. Format each item: <li><a href='LINK'>TITLE</a> — one sentence summary</li>. Return ONLY the <ul>...</ul> block, nothing else."
+  },
+  {
+    "label": "👨‍👩‍👧 Triangle on the Cheap — Family & Kids Events",
+    "prompt": "Visit https://triangleonthecheap.com/ right now. Look specifically for upcoming events that are suitable for families and children in the Raleigh-Durham-Chapel Hill (RTP), NC area. Prioritize: kids activities, family festivals, outdoor events, free admission days, storytime, playgrounds, nature walks, family movies, crafts, museums, zoos, science centers. Return the top 7 results as an HTML list. Format each item: <li><a href='EVENT_URL'>EVENT NAME</a> — date, location, and one-line description</li>. Return ONLY the <ul>...</ul> block, nothing else.",
+    "url": "https://www.eventbrite.com/d/nc--raleigh/family--events/"
+  },
+  {
+    "label": "💻 Eventbrite — RTP Tech Events",
+    "prompt": "Visit https://www.eventbrite.com/d/nc--raleigh/technology--events/ right now. Find the top 7 upcoming tech events in the Raleigh/Durham/Chapel Hill (RTP), North Carolina area happening this week or next. Prioritize: hackathons, developer meetups, AI/ML talks, startup events, coding workshops, cybersecurity, cloud computing, engineering talks. Return them as an HTML list. Format each item: <li><a href='EVENT_URL'>EVENT NAME</a> — date, venue, and one-line description</li>. Return ONLY the <ul>...</ul> block, nothing else.",
+    "timeout": 300,
+    "url": "https://www.eventbrite.com/d/nc--raleigh/technology--events/"
+  },
+  {
+    "label": "🎟️ Ticketmaster — RTP Events (27519)",
+    "prompt": "Visit https://www.ticketmaster.com/search?q=events&radius=25&postalCode=27519 right now. Find upcoming events near zip code 27519 (Cary/RTP, NC) within 25 miles. Filter for events in these categories ONLY: kids & family shows, electronic music, sports, comedy, concerts for kids. Skip anything that doesn't fit those categories. Return the top 7 most interesting results as an HTML list. Format each item: <li><a href='EVENT_URL'>EVENT NAME</a> — date, venue, category tag, and one-line description</li>. Return ONLY the <ul>...</ul> block, nothing else.",
+    "timeout": 300,
+    "url": "https://www.eventbrite.com/d/nc--raleigh/family--events/"
+  },
+  {
+    "label": "👥 Meetup — RTP Tech Meetups",
+    "prompt": "Visit https://www.meetup.com/find/?location=Raleigh%2C+NC&source=EVENTS&categoryId=546 right now. Find the top 7 upcoming tech-focused meetups in the Raleigh-Durham (RTP), North Carolina area happening this week or next. Prioritize: software engineering, AI/ML, data science, DevOps, cloud, cybersecurity, startup, entrepreneurship, coding groups. Return them as an HTML list. Format each item: <li><a href='EVENT_URL'>MEETUP NAME</a> — date, group name, and one-line description</li>. Return ONLY the <ul>...</ul> block, nothing else.",
+    "timeout": 300,
+    "url": "https://www.eventbrite.com/d/nc--raleigh/science-and-tech--events/"
   }
 ]

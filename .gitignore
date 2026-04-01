@@ -3,6 +3,7 @@ credentials.json
 client_secret.json
 client_secret_*.json
 token.json
+.circuit_state.json
 *.log
 
 # Byte-compiled / optimized / DLL files

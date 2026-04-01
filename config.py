@@ -28,6 +28,8 @@ TOKEN_FILE       = Path(os.path.expanduser(_CREDS["gmail_token"]))
 YANDEX_IMAP      = _CREDS["yandex_imap"]
 YANDEX_USER      = _CREDS["yandex_user"]
 YANDEX_PASS      = _CREDS["yandex_password"]
+ALIEXPRESS_USER  = _CREDS.get("aliexpress_user", "")
+ALIEXPRESS_PASS  = _CREDS.get("aliexpress_password", "")
 
 MUTED_SENDERS    = _load_json("muted_senders.json")
 ALWAYS_IMPORTANT = _load_json("important_senders.json")
@@ -62,3 +64,10 @@ def load_prompt(filename):
         raise SystemExit(f"ERROR: prompt file {filename} not found in {BASE_DIR}")
     return p.read_text()
 
+
+# Resolve codex binary — cron doesn't have /opt/homebrew/bin in PATH
+import shutil as _shutil
+CODEX_BIN = (
+    _shutil.which("codex") or
+    "/opt/homebrew/bin/codex"
+)
