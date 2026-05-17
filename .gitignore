@@ -4,7 +4,10 @@ client_secret.json
 client_secret_*.json
 token.json
 .circuit_state.json
+.morning_digest_retry.json
 *.log
+*:Zone.Identifier
+data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
