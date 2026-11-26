@@ -1,0 +1,36 @@
+[
+ {
+  "event": "cross-referenced",
+  "created_at": "2026-04-27T09:33:14Z",
+  "source": {
+   "issue": {
+    "number": 61,
+    "state": "closed",
+    "html_url": "https://github.com/o11y-dev/opentelemetry-skill/issues/61",
+    "repository_url": "https://api.github.com/repos/o11y-dev/opentelemetry-skill",
+    "pull_request": null,
+    "title": "Upstream digest (tier 2) \u2014"
+   }
+  }
+ },
+ {
+  "event": "cross-referenced",
+  "created_at": "2026-10-31T04:42:27Z",
+  "source": {
+   "issue": {
+    "number": 5867,
+    "state": "open",
+    "html_url": "https://github.com/open-telemetry/opentelemetry-python/pull/5867",
+    "repository_url": "https://api.github.com/repos/open-telemetry/opentelemetry-python",
+    "pull_request": {
+     "url": "https://api.github.com/repos/open-telemetry/opentelemetry-python/pulls/5867",
+     "html_url": "https://github.com/open-telemetry/opentelemetry-python/pull/5867",
+     "diff_url": "https://github.com/open-telemetry/opentelemetry-python/pull/5867.diff",
+     "patch_url": "https://github.com/open-telemetry/opentelemetry-python/pull/5867.patch",
+     "merged_at": null
+    },
+    "title": "docs: document public API check workaround for patch releases"
+   }
+  }
+ }
+]

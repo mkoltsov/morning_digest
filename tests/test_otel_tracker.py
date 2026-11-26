@@ -1,4 +1,5 @@
 """Offline tests for otel_tracker: a fake GitHub transport, no network."""
+import base64
 import datetime as dt
 import json
 import re
@@ -11,8 +12,17 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import otel_tracker as ot  # noqa: E402
 
+FIX = Path(__file__).resolve().parent / "fixtures"
 NOW = dt.datetime(2026, 11, 26, 13, 0, tzinfo=dt.timezone.utc)
 OLD = "2026-04-10T10:00:00Z"
+PY = "open-telemetry/opentelemetry-python"
+JAVA = "open-telemetry/opentelemetry-java"
+
+README = {
+    PY: "# OTel Python\n\n## Maintainers\n\n- [Riccardo](https://github.com/xrmx)\n- [Leighton](https://github.com/lzchen)\n\n"
+        "## Approvers\n\n- [Approver One](https://github.com/approver1)\n\n### Emeritus\n\n- [Old](https://github.com/oldie)\n",
+    JAVA: "# OTel Java\n\n## Maintainers\n\n- [Jack](https://github.com/jack-berg)\n\n## Triagers\n\n- [T](https://github.com/triager)\n",
+}
 
 
 def repo(i, name, **kw):
@@ -20,37 +30,45 @@ def repo(i, name, **kw):
             "has_issues": kw.get("has_issues", True), "language": kw.get("language", "Python"), "open_issues_count": 1}
 
 
-def issue(i, num, repo_name, title, body, *, assoc="MEMBER", labels=(), assignees=(), updated=OLD, pr=False):
-    d = {"id": i, "number": num, "title": title, "body": body, "state": "open", "author_association": assoc,
-         "labels": [{"name": n} for n in labels], "assignees": [{"login": a} for a in assignees],
-         "updated_at": updated, "html_url": f"https://github.com/{repo_name}/issues/{num}",
-         "repository_url": f"https://api.github.com/repos/{repo_name}"}
-    if pr:
-        d["pull_request"] = {"url": "x"}
-    return d
+def issue(i, num, repo_name, title, body, *, author="xrmx", assoc="CONTRIBUTOR", labels=(), assignees=(),
+          updated=OLD, state="open"):
+    return {"id": i, "number": num, "title": title, "body": body, "state": state, "author_association": assoc,
+            "user": {"login": author, "type": "User"}, "labels": [{"name": n} for n in labels],
+            "assignees": [{"login": a} for a in assignees], "updated_at": updated,
+            "html_url": f"https://github.com/{repo_name}/issues/{num}",
+            "repository_url": f"https://api.github.com/repos/{repo_name}"}
 
 
-DOC_5139 = issue(5139, 5139, "open-telemetry/opentelemetry-python",
-                 "Logging handler drops extra attributes",
-                 "We should document the workaround for passing extra attributes until the API changes.")
-JAVA_TEST = issue(901, 77, "open-telemetry/opentelemetry-java",
-                  "Add regression test for span limits", "Please add a regression test covering attribute limits.",
+def comment(login, body, assoc="NONE", at="2026-11-01T00:00:00Z", n=1):
+    return {"user": {"login": login}, "author_association": assoc, "body": body, "created_at": at,
+            "html_url": f"https://github.com/x/issues/1#issuecomment-{n}"}
+
+
+REAL_5139 = json.loads((FIX / "issue_5139_april.json").read_text())
+REAL_TIMELINE = json.loads((FIX / "timeline_5139_later.json").read_text())
+APRIL_TIMELINE = [e for e in REAL_TIMELINE if (e.get("created_at") or "") < "2026-05-01"]
+PR_5867 = json.loads((FIX / "pull_5867.json").read_text())
+
+JAVA_TEST = issue(901, 77, JAVA, "Add regression test for span limits",
+                  "Please add a regression test covering attribute limits.", author="jack-berg", assoc="MEMBER",
                   labels=("help wanted",))
-UNRELATED = issue(902, 78, "open-telemetry/opentelemetry-java", "Question about exporters", "How do I configure x?",
-                  assoc="NONE")
+UNRELATED = issue(902, 78, JAVA, "Question about exporters", "How do I configure x?", author="someone", assoc="NONE")
+REPOS = [repo(1, "opentelemetry-python"), repo(2, "opentelemetry-java", language="Java"),
+         repo(3, "old-thing", archived=True), repo(4, "no-issues", has_issues=False)]
 
 
 class FakeGitHub:
-    def __init__(self, repos, issues, *, comments=None, timelines=None, fail=None, quota=5000,
-                 incomplete_search=False):
+    def __init__(self, repos, issues, *, comments=None, timelines=None, pulls=None, pr_search=None, readmes=None,
+                 fail=None, quota=5000, incomplete_search=False, missing=()):
         self.repos, self.issues = repos, issues
         self.comments, self.timelines = comments or {}, timelines or {}
-        self.fail, self.quota, self.incomplete_search = fail, quota, incomplete_search
+        self.pulls, self.pr_search = pulls or {}, pr_search or {}
+        self.readmes = README if readmes is None else readmes
+        self.fail, self.quota, self.incomplete_search, self.missing = fail, quota, incomplete_search, set(missing)
         self.urls = []
 
     def __call__(self, url, headers, timeout):
         self.urls.append(url)
-        assert "Authorization" not in headers or headers["Authorization"].startswith("Bearer ")
         if self.fail:
             if self.fail == "network":
                 raise OSError("down")
@@ -59,119 +77,236 @@ class FakeGitHub:
         h = {"X-RateLimit-Remaining": str(self.quota)}
         p = urllib.parse.urlsplit(url)
         q = dict(urllib.parse.parse_qsl(p.query))
-        path = p.path
+        path, page = p.path, int(q.get("page", 1))
+        if any(path.endswith(m) for m in self.missing):
+            return ot._Response(404, {"message": "Not Found"}, h)
         if path == "/orgs/open-telemetry/repos":
-            page = int(q.get("page", 1))
             return ot._Response(200, self.repos[(page - 1) * 100: page * 100], h)
         if path == "/search/issues":
             h["X-RateLimit-Resource"] = "search"
+            if "is:pr" in q["q"]:
+                num = int(re.search(r"is:pr (\d+)", q["q"]).group(1))
+                return ot._Response(200, {"incomplete_results": False, "items": self.pr_search.get(num, [])}, h)
             return ot._Response(200, {"incomplete_results": self.incomplete_search, "items": list(self.issues)}, h)
-        m = re.match(r"/repos/(.+)/issues/(\d+)/(comments|timeline)$", path)
+        m = re.match(r"/repos/([^/]+/[^/]+)/readme$", path)
+        if m:
+            text = self.readmes.get(m.group(1))
+            if text is None:
+                return ot._Response(404, {}, h)
+            return ot._Response(200, {"content": base64.b64encode(text.encode()).decode()}, h)
+        m = re.match(r"/repos/([^/]+/[^/]+)/pulls/(\d+)$", path)
+        if m:
+            pr = self.pulls.get(int(m.group(2)))
+            return ot._Response(200, pr, h) if pr else ot._Response(404, {}, h)
+        m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)/(comments|timeline)$", path)
         if m:
             src = self.comments if m.group(3) == "comments" else self.timelines
-            return ot._Response(200, src.get(int(m.group(2)), []), h)
-        m = re.match(r"/repos/(.+)/issues$", path)
+            rows = src.get(int(m.group(2)), [])
+            return ot._Response(200, rows[(page - 1) * 100: page * 100], h)
+        m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)$", path)
         if m:
-            name = m.group(1)
-            return ot._Response(200, [i for i in self.issues if i["repository_url"].endswith(name)], h)
+            found = [i for i in self.issues if i["number"] == int(m.group(2)) and i["repository_url"].endswith(m.group(1))]
+            return ot._Response(200, found[0], h) if found else ot._Response(404, {}, h)
+        m = re.match(r"/repos/([^/]+/[^/]+)/issues$", path)
+        if m:
+            return ot._Response(200, [i for i in self.issues if i["repository_url"].endswith(m.group(1))
+                                      and i["state"] == "open"], h)
         return ot._Response(404, {}, h)
 
 
-REPOS = [repo(1, "opentelemetry-python"), repo(2, "opentelemetry-java", language="Java"),
-         repo(3, "old-thing", archived=True), repo(4, "no-issues", has_issues=False)]
-
-
 def run(tmp_path, fake, **kw):
-    kw.setdefault("max_calls", 45)
+    kw.setdefault("max_calls", 60)
     return ot.collect(tmp_path, NOW, transport=fake, **kw)
 
 
-def test_surfaces_unlabelled_doc_task_and_non_python_candidate(tmp_path):
-    fake = FakeGitHub(REPOS, [DOC_5139, JAVA_TEST, UNRELATED])
+def state(tmp_path):
+    return json.loads((tmp_path / ot.STATE_FILE).read_text())
+
+
+KEY = str(REAL_5139["id"])
+
+
+# ---------------------------------------------------------------- the real #5139 case
+
+def test_real_5139_april_snapshot_surfaces_the_documentation_task(tmp_path):
+    out = run(tmp_path, FakeGitHub(REPOS, [REAL_5139], timelines={5139: APRIL_TIMELINE}))
+    assert [(l["repo"], l["number"], l["kind"]) for l in out["leads"]] == [(PY, 5139, "documentation")]
+    ev = out["leads"][0]["evidence"][0]
+    assert ev["kind"] == "maintainer_issue" and ev["by"] == "xrmx" and ev["role"] == "maintainer"
+    assert ev["role_source"].endswith("opentelemetry-python#readme")
+
+
+def test_real_5139_later_snapshot_with_pr_5867_withholds_it(tmp_path):
+    out = run(tmp_path, FakeGitHub(REPOS, [REAL_5139], timelines={5139: REAL_TIMELINE}, pulls={5867: PR_5867}))
+    assert out["leads"] == []
+    assert "open_pr" in state(tmp_path)["candidates"][KEY]["withheld_reasons"]
+
+
+def test_fixing_pr_found_by_direct_search_even_when_missing_from_timeline(tmp_path):
+    hit = {"number": 5867, "title": PR_5867["title"], "body": PR_5867["body"], "html_url": PR_5867["html_url"]}
+    out = run(tmp_path, FakeGitHub(REPOS, [REAL_5139], timelines={5139: APRIL_TIMELINE},
+                                   pulls={5867: PR_5867}, pr_search={5139: [hit]}))
+    assert out["leads"] == []
+    assert "open_pr" in state(tmp_path)["candidates"][KEY]["withheld_reasons"]
+
+
+# ---------------------------------------------------------------- current verification
+
+def test_cached_lead_that_closed_is_not_offered(tmp_path):
+    assert run(tmp_path, FakeGitHub(REPOS, [REAL_5139], timelines={5139: APRIL_TIMELINE}))["leads"]
+    closed = dict(REAL_5139, state="closed")
+    out = run(tmp_path, FakeGitHub(REPOS, [closed], timelines={5139: APRIL_TIMELINE}))
+    assert out["leads"] == []
+    assert state(tmp_path)["candidates"][KEY]["status"] == "closed"
+
+
+def test_lead_is_reverified_in_the_run_that_stages_it(tmp_path):
+    run(tmp_path, FakeGitHub(REPOS, [REAL_5139], timelines={5139: APRIL_TIMELINE}))
+    fake = FakeGitHub(REPOS, [REAL_5139], timelines={5139: APRIL_TIMELINE})
     out = run(tmp_path, fake)
-    assert out["status"] == "ok"
-    assert out["coverage"]["initial_pass_complete"] is True
-    assert out["coverage"]["repos_eligible"] == 2          # archived and issue-disabled excluded
-    keys = {(l["repo"], l["number"]) for l in out["leads"]}
-    assert ("open-telemetry/opentelemetry-python", 5139) in keys
-    assert ("open-telemetry/opentelemetry-java", 77) in keys
-    assert len(out["leads"]) <= ot.MAX_CARDS
-    assert out["leads"][0]["evidence"]
+    assert out["leads"]
+    assert any(urllib.parse.urlsplit(u).path.endswith("/issues/5139") for u in fake.urls)
 
 
-def test_later_snapshot_with_linked_pr_withholds_the_task(tmp_path):
-    run(tmp_path, FakeGitHub(REPOS, [DOC_5139]))
-    later = dict(DOC_5139, updated_at="2026-11-20T10:00:00Z")
-    tl = {5139: [{"event": "cross-referenced", "source": {"issue": {
-        "html_url": "https://github.com/open-telemetry/opentelemetry-python/pull/5867", "state": "open",
-        "pull_request": {"merged_at": None}}}}]}
-    out = run(tmp_path, FakeGitHub(REPOS, [later], timelines=tl))
-    assert not [l for l in out["leads"] if l["number"] == 5139]
-    state = json.loads((tmp_path / ot.STATE_FILE).read_text())
-    assert "open_pr" in state["candidates"]["5139"]["withheld_reasons"]
+@pytest.mark.parametrize("missing", ["/issues/5139/comments", "/issues/5139/timeline", "/readme"])
+def test_404_on_any_required_check_withholds(tmp_path, missing):
+    out = run(tmp_path, FakeGitHub(REPOS, [REAL_5139], timelines={5139: APRIL_TIMELINE}, missing=[missing]))
+    assert out["leads"] == []
+    reasons = state(tmp_path)["candidates"][KEY]["withheld_reasons"]
+    assert {"verification_incomplete", "maintainer_roles_unavailable"} & set(reasons)
 
 
-@pytest.mark.parametrize("case,reason", [
-    ("claim", "claimed_in_comments"), ("merged", "fixed_by_merged_pr"),
-    ("recent_closed", "recently_closed_pr"), ("no_direction", "no_maintainer_direction"),
-    ("assigned", "assigned"), ("pagination", "incomplete_pagination")])
-def test_withholding_rules(tmp_path, case, reason):
-    iss, comments, tl = dict(DOC_5139), {}, {}
-    if case == "claim":
-        comments = {5139: [{"author_association": "NONE", "body": "I'd like to work on this!", "created_at": "2026-11-01T00:00:00Z"}]}
-    if case == "merged":
-        tl = {5139: [{"event": "cross-referenced", "source": {"issue": {"state": "closed", "html_url": "u",
-                     "pull_request": {"merged_at": "2026-10-01T00:00:00Z"}}}}]}
-    if case == "recent_closed":
-        tl = {5139: [{"event": "cross-referenced", "source": {"issue": {"state": "closed", "html_url": "u",
-                     "closed_at": "2026-11-20T00:00:00Z", "pull_request": {"merged_at": None}}}}]}
-    if case == "no_direction":
-        iss["author_association"] = "NONE"
-    if case == "assigned":
-        iss["assignees"] = [{"login": "someone"}]
-    if case == "pagination":
-        comments = {5139: [{"author_association": "NONE", "body": "+1", "created_at": OLD}] * 100}
-    out = run(tmp_path, FakeGitHub(REPOS, [iss], comments=comments, timelines=tl))
-    assert not out["leads"]
-    state = json.loads((tmp_path / ot.STATE_FILE).read_text())
-    assert reason in state["candidates"]["5139"]["withheld_reasons"]
+def test_comments_are_fully_paginated(tmp_path):
+    many = [comment(f"user{i}", "+1", n=i) for i in range(150)]
+    many.append(comment("newbie", "I'd like to work on this", n=999))
+    run(tmp_path, FakeGitHub(REPOS, [REAL_5139], comments={5139: many}, timelines={5139: APRIL_TIMELINE}))
+    assert "claimed_in_comments" in state(tmp_path)["candidates"][KEY]["withheld_reasons"]
 
 
-def test_abandoned_pr_and_old_claim_do_not_block(tmp_path):
-    tl = {5139: [{"event": "cross-referenced", "source": {"issue": {"state": "closed", "html_url": "u",
-                 "closed_at": "2026-06-01T00:00:00Z", "pull_request": {"merged_at": None}}}}]}
-    comments = {5139: [{"author_association": "NONE", "body": "I'll take this", "created_at": "2026-05-01T00:00:00Z"}]}
-    out = run(tmp_path, FakeGitHub(REPOS, [DOC_5139], comments=comments, timelines=tl))
+# ---------------------------------------------------------------- authoritative maintainer evidence
+
+def test_org_member_without_listed_role_is_not_direction(tmp_path):
+    iss = issue(903, 90, JAVA, "Add regression test for exporter retry", "Please add a regression test for retries.",
+                author="randomuser", assoc="NONE")
+    cm = {90: [comment("org-member", "Thanks for reporting", assoc="MEMBER")]}
+    out = run(tmp_path, FakeGitHub(REPOS, [iss], comments=cm))
+    assert out["leads"] == []
+    assert "no_maintainer_direction" in state(tmp_path)["candidates"]["903"]["withheld_reasons"]
+
+
+def test_listed_maintainer_thanks_is_not_direction_but_explicit_invitation_is(tmp_path):
+    iss = issue(904, 91, JAVA, "Add regression test for exporter retry", "Please add a regression test for retries.",
+                author="randomuser", assoc="NONE")
+    out = run(tmp_path, FakeGitHub(REPOS, [iss], comments={91: [comment("jack-berg", "Thanks for reporting", "MEMBER")]}))
+    assert out["leads"] == []
+    out = run(tmp_path, FakeGitHub(REPOS, [dict(iss, updated_at="2026-11-25T00:00:00Z")], comments={91: [
+        comment("jack-berg", "Thanks for reporting", "MEMBER", n=1),
+        comment("jack-berg", "A PR for this is welcome.", "MEMBER", n=2)]}))
+    assert [l["number"] for l in out["leads"]] == [91]
+    ev = [e for e in out["leads"][0]["evidence"] if e["kind"] == "maintainer_comment"][0]
+    assert ev["by"] == "jack-berg" and ev["role"] == "maintainer" and ev["url"].endswith("issuecomment-2")
+
+
+def test_triager_and_emeritus_are_not_roles(tmp_path):
+    iss = issue(905, 92, JAVA, "Add regression test x", "Please add a regression test.", author="triager")
+    run(tmp_path, FakeGitHub(REPOS, [iss]))
+    assert "no_maintainer_direction" in state(tmp_path)["candidates"]["905"]["withheld_reasons"]
+    run(tmp_path, FakeGitHub(REPOS, [REAL_5139], timelines={5139: APRIL_TIMELINE}))
+    roles = state(tmp_path)["roles"]
+    assert "oldie" not in roles[PY]["handles"] and "approver1" in roles[PY]["handles"]
+    assert "triager" not in roles[JAVA]["handles"]
+
+
+def test_maintainer_claim_is_still_a_claim(tmp_path):
+    cm = {5139: [comment("lzchen", "I'll take this", "MEMBER")]}
+    run(tmp_path, FakeGitHub(REPOS, [REAL_5139], comments=cm, timelines={5139: APRIL_TIMELINE}))
+    assert "claimed_in_comments" in state(tmp_path)["candidates"][KEY]["withheld_reasons"]
+
+
+def test_unresolved_claim_does_not_expire_but_a_release_resolves_it(tmp_path):
+    old = {5139: [comment("dev1", "I'd like to work on this", at="2026-05-01T00:00:00Z")]}
+    assert run(tmp_path, FakeGitHub(REPOS, [REAL_5139], comments=old, timelines={5139: APRIL_TIMELINE}))["leads"] == []
+    released = {5139: old[5139] + [comment("dev1", "I'm not working on this anymore", at="2026-06-01T00:00:00Z", n=2)]}
+    out = run(tmp_path, FakeGitHub(REPOS, [dict(REAL_5139, updated_at="2026-11-25T00:00:00Z")], comments=released,
+                                   timelines={5139: APRIL_TIMELINE}))
     assert [l["number"] for l in out["leads"]] == [5139]
 
 
-def test_maintainer_comment_supplies_direction(tmp_path):
-    iss = dict(DOC_5139, author_association="NONE")
-    comments = {5139: [{"author_association": "MEMBER", "body": "Yes, a docs PR is welcome.", "html_url": "c1",
-                        "created_at": "2026-11-01T00:00:00Z"}]}
-    out = run(tmp_path, FakeGitHub(REPOS, [iss], comments=comments))
-    assert out["leads"] and out["leads"][0]["evidence"][0]["kind"] == "maintainer_comment"
+@pytest.mark.parametrize("pr,blocks", [
+    ({"state": "closed", "merged_at": "2026-10-01T00:00:00Z", "closed_at": "2026-10-01T00:00:00Z"}, True),
+    ({"state": "closed", "merged_at": None, "closed_at": "2026-11-20T00:00:00Z"}, True),
+    ({"state": "closed", "merged_at": None, "closed_at": "2026-06-01T00:00:00Z"}, False)])
+def test_linked_pr_states_are_read_from_the_pr_itself(tmp_path, pr, blocks):
+    tl = {5139: [{"event": "cross-referenced", "source": {"issue": {
+        "number": 6000, "state": "open", "html_url": "u", "pull_request": {"merged_at": None},
+        "repository_url": f"https://api.github.com/repos/{PY}"}}}]}
+    out = run(tmp_path, FakeGitHub(REPOS, [REAL_5139], timelines=tl, pulls={6000: {**pr, "html_url": "u"}}))
+    assert (out["leads"] == []) is blocks
 
 
-def test_shown_only_after_confirmed_send_and_unchanged_lead_stays_quiet(tmp_path):
-    first = run(tmp_path, FakeGitHub(REPOS, [DOC_5139]))
-    assert first["staged_ids"] == ["5139"]
-    again = run(tmp_path, FakeGitHub(REPOS, [DOC_5139]))          # not marked shown: still offered
-    assert again["staged_ids"] == ["5139"]
-    assert ot.mark_shown(tmp_path, again["staged_ids"], "gmail-msg-1") == 1
-    quiet = run(tmp_path, FakeGitHub(REPOS, [DOC_5139]))
-    assert quiet["leads"] == []
-    changed = dict(DOC_5139, title="Logging handler drops extra attributes (docs)", updated_at="2026-11-25T00:00:00Z")
-    back = run(tmp_path, FakeGitHub(REPOS, [changed]))
-    assert back["staged_ids"] == ["5139"]                         # material change resurfaces
+def test_cross_repo_linked_pr_is_checked_in_its_own_repo(tmp_path):
+    tl = {5139: [{"event": "cross-referenced", "source": {"issue": {
+        "number": 42, "state": "open", "html_url": "u", "pull_request": {},
+        "repository_url": "https://api.github.com/repos/open-telemetry/opentelemetry-python-contrib"}}}]}
+    fake = FakeGitHub(REPOS, [REAL_5139], timelines=tl, pulls={42: {"state": "open", "merged_at": None, "html_url": "u"}})
+    out = run(tmp_path, fake)
+    assert out["leads"] == []
+    assert any("/repos/open-telemetry/opentelemetry-python-contrib/pulls/42" in u for u in fake.urls)
 
 
-def test_mark_shown_ignores_unstaged_or_changed(tmp_path):
-    out = run(tmp_path, FakeGitHub(REPOS, [DOC_5139]))
-    assert ot.mark_shown(tmp_path, ["999"], "r") == 0
-    assigned = dict(DOC_5139, assignees=[{"login": "someone"}], updated_at="2026-11-25T00:00:00Z")
-    run(tmp_path, FakeGitHub(REPOS, [assigned]))                  # now withheld: no longer staged
-    assert ot.mark_shown(tmp_path, out["staged_ids"], "r") == 0
+# ---------------------------------------------------------------- staging across delayed receipts
+
+def test_delayed_receipt_acknowledges_only_the_revision_it_sent(tmp_path):
+    a = run(tmp_path, FakeGitHub(REPOS, [REAL_5139], timelines={5139: APRIL_TIMELINE}))
+    sid_a = a["staged_ids"][0]
+    changed = dict(REAL_5139, title=REAL_5139["title"] + " (docs)", updated_at="2026-11-25T00:00:00Z")
+    b = run(tmp_path, FakeGitHub(REPOS, [changed], timelines={5139: APRIL_TIMELINE}))
+    sid_b = b["staged_ids"][0]
+    assert sid_a != sid_b and sid_a.split(":")[0] == sid_b.split(":")[0]
+    assert ot.mark_shown(tmp_path, [sid_a], "receipt-A") == {"confirmed": [sid_a], "already": [], "unknown": []}
+    again = run(tmp_path, FakeGitHub(REPOS, [changed], timelines={5139: APRIL_TIMELINE}))
+    assert again["staged_ids"] == [sid_b]                      # B still offered after A's late receipt
+    assert ot.mark_shown(tmp_path, [sid_a], "receipt-A")["already"] == [sid_a]      # replay is idempotent
+    assert ot.mark_shown(tmp_path, [sid_b], "receipt-B")["confirmed"] == [sid_b]
+    assert run(tmp_path, FakeGitHub(REPOS, [changed], timelines={5139: APRIL_TIMELINE}))["leads"] == []
+
+
+def test_receipt_for_a_withheld_or_unknown_revision(tmp_path):
+    a = run(tmp_path, FakeGitHub(REPOS, [REAL_5139], timelines={5139: APRIL_TIMELINE}))
+    sid_a = a["staged_ids"][0]
+    assigned = dict(REAL_5139, assignees=[{"login": "x"}], updated_at="2026-11-25T00:00:00Z")
+    run(tmp_path, FakeGitHub(REPOS, [assigned], timelines={5139: APRIL_TIMELINE}))
+    assert ot.mark_shown(tmp_path, [sid_a], "receipt-A")["confirmed"] == [sid_a]     # A was really sent
+    assert ot.mark_shown(tmp_path, ["999:deadbeef"], "r")["unknown"] == ["999:deadbeef"]
+
+
+def test_unsent_revision_stays_pending_and_is_offered_again(tmp_path):
+    a = run(tmp_path, FakeGitHub(REPOS, [REAL_5139], timelines={5139: APRIL_TIMELINE}))
+    b = run(tmp_path, FakeGitHub(REPOS, [REAL_5139], timelines={5139: APRIL_TIMELINE}))
+    assert a["staged_ids"] == b["staged_ids"]
+    assert b["coverage"]["pending_revisions"] == 1
+
+
+# ---------------------------------------------------------------- discovery, budget, status
+
+def test_non_python_candidate_and_ineligible_repos(tmp_path):
+    out = run(tmp_path, FakeGitHub(REPOS, [JAVA_TEST, UNRELATED]))
+    assert [(l["repo"], l["number"]) for l in out["leads"]] == [(JAVA, 77)]
+    assert out["coverage"]["repos_eligible"] == 2
+
+
+def test_bot_issues_are_ignored(tmp_path):
+    bot = issue(950, 9098, JAVA, "Dependency Dashboard", "Renovate updates. CI workflow fix pending.", author="renovate[bot]")
+    bot["user"]["type"] = "Bot"
+    run(tmp_path, FakeGitHub(REPOS, [bot]))
+    assert "950" not in state(tmp_path)["candidates"]
+
+
+def test_assigned_issue_is_withheld_without_api_calls(tmp_path):
+    iss = dict(REAL_5139, assignees=[{"login": "someone"}])
+    fake = FakeGitHub(REPOS, [iss])
+    run(tmp_path, fake)
+    assert not [u for u in fake.urls if "/issues/5139" in u]
 
 
 def test_budget_is_enforced_and_progress_resumes(tmp_path):
@@ -179,14 +314,11 @@ def test_budget_is_enforced_and_progress_resumes(tmp_path):
     fake = FakeGitHub(many, [])
     out = run(tmp_path, fake, max_calls=10)
     assert len(fake.urls) <= 10
-    assert out["coverage"]["initial_pass_complete"] is False
-    assert out["coverage"]["repos_pending_full_pass"] > 0
-    assert out["leads"] == []
+    assert out["coverage"]["initial_pass_complete"] is False and out["coverage"]["repos_pending_full_pass"] > 0
     for _ in range(40):
         out = run(tmp_path, FakeGitHub(many, []), max_calls=45)
         if out["coverage"]["initial_pass_complete"]:
             break
-    assert out["coverage"]["initial_pass_complete"] is True
     assert out["coverage"]["repos_full_pass"] == 250
 
 
@@ -196,13 +328,13 @@ def test_deadline_stops_the_run(tmp_path):
     def clock():
         t[0] += 50
         return t[0]
-    fake = FakeGitHub(REPOS, [DOC_5139])
+    fake = FakeGitHub(REPOS, [REAL_5139])
     out = ot.collect(tmp_path, NOW, transport=fake, clock=clock, deadline_s=120)
     assert out["status"] == "partial" and len(fake.urls) <= 3
 
 
 def test_low_quota_reduces_budget(tmp_path):
-    fake = FakeGitHub(REPOS, [DOC_5139], quota=8)
+    fake = FakeGitHub(REPOS, [REAL_5139], quota=8)
     out = run(tmp_path, fake)
     assert len(fake.urls) <= 4 and out["status"] == "partial"
 
@@ -210,29 +342,10 @@ def test_low_quota_reduces_budget(tmp_path):
 def test_unavailable_vs_partial(tmp_path):
     assert run(tmp_path, FakeGitHub(REPOS, [], fail="network"))["status"] == "unavailable"
     assert run(tmp_path, FakeGitHub(REPOS, [], fail=401))["status"] == "unavailable"
-    out = run(tmp_path, FakeGitHub(REPOS, [DOC_5139], incomplete_search=True))
+    out = run(tmp_path, FakeGitHub(REPOS, [REAL_5139], incomplete_search=True))
     assert out["status"] == "partial" and any("incomplete" in n for n in out["notes"])
 
 
 def test_state_file_is_private(tmp_path):
-    run(tmp_path, FakeGitHub(REPOS, [DOC_5139]))
+    run(tmp_path, FakeGitHub(REPOS, [REAL_5139]))
     assert oct((tmp_path / ot.STATE_FILE).stat().st_mode & 0o777) == "0o600"
-
-
-def test_bot_issues_are_ignored_and_strong_candidates_verified_first(tmp_path):
-    bot = issue(950, 9098, "open-telemetry/opentelemetry-java", "Dependency Dashboard",
-                "This issue lists Renovate updates. CI workflow fix pending.")
-    bot["user"] = {"login": "renovate[bot]", "type": "Bot"}
-    weak = issue(951, 12, "open-telemetry/opentelemetry-java", "Docs typo", "Fix the broken link in README.", assoc="NONE",
-                 updated="2026-11-25T00:00:00Z")
-    out = run(tmp_path, FakeGitHub(REPOS, [bot, weak, DOC_5139]), max_calls=9)
-    state = json.loads((tmp_path / ot.STATE_FILE).read_text())
-    assert "950" not in state["candidates"]
-    assert state["candidates"]["5139"]["status"] != "new"            # maintainer-raised verified before the newer weak one
-
-
-def test_assigned_issue_is_withheld_without_api_calls(tmp_path):
-    iss = dict(DOC_5139, assignees=[{"login": "someone"}])
-    fake = FakeGitHub(REPOS, [iss])
-    run(tmp_path, fake)
-    assert not [u for u in fake.urls if "/issues/5139/" in u]

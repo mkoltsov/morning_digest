@@ -1,0 +1,18 @@
+{
+ "id": 4323125229,
+ "number": 5139,
+ "title": "Issues when releasting patch releases",
+ "body": "When releasing 1.41.1 I have found a couple of issues:\n\n- contrib tests environments are from main: https://github.com/open-telemetry/opentelemetry-python/blob/main/.github/workflows/ci.yml#L27. So we have no guarantee that the environments referenced in main is available in the release branch. In this case after dropping 3.9 support the main tox.ini had a couple of combinations that are missing in the release branch.\nAvailable workaround: we can update the version in the template and in the rendered workflow so that we run the proper tests\n\n- public-symbols-check: api changes are compared against main and not against the branch\nAvailable workaround: use the Approve Public API check label\n\nNothing severe but if a fix is not available we should document the issues in RELEASING.md.",
+ "state": "open",
+ "author_association": "CONTRIBUTOR",
+ "created_at": "2026-04-24T13:09:44Z",
+ "updated_at": "2026-04-24T13:58:03Z",
+ "html_url": "https://github.com/open-telemetry/opentelemetry-python/issues/5139",
+ "repository_url": "https://api.github.com/repos/open-telemetry/opentelemetry-python",
+ "user": {
+  "login": "xrmx",
+  "type": "User"
+ },
+ "labels": [],
+ "assignees": []
+}

@@ -1,0 +1,9 @@
+{
+ "number": 5867,
+ "state": "open",
+ "merged_at": null,
+ "closed_at": null,
+ "html_url": "https://github.com/open-telemetry/opentelemetry-python/pull/5867",
+ "title": "docs: document public API check workaround for patch releases",
+ "body": "# Description\r\n\r\nFixes #5139, documentation update to make it look consistent.\r\n\r\n## Type of change\r\n\r\n- [x] This change requires a documentation update\r\n\r\n# Checklist:\r\n\r\nSee [contributing.md](https://github.com/open-telemetry/opentelemetry-python/blob/main/CONTRIBUTING.md) for styleguide, changelog guidelines, and more.\r\n\r\n- [x] I am a human and not a bot\r\n- [x] I have run `tox -e precommit`\r\n- [x] I have run `tox -e typecheck`\r\n"
+}

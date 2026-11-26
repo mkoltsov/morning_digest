@@ -48,12 +48,12 @@ INVENTORY_TTL_S = 24 * 3600
 RECENT_WINDOW_OVERLAP_S = 2 * 3600       # overlapping search windows: never miss an edge update
 ROTATION_SHARE = 0.4                     # budget reserved for the repo rotation
 VERIFY_SHARE = 0.3                       # budget reserved for verifying candidates
-CLAIM_WINDOW_DAYS = 60
 ABANDONED_PR_DAYS = 30
 REVERIFY_AFTER_S = 12 * 3600
 MAINTAINER_ASSOC = {"OWNER", "MEMBER", "COLLABORATOR"}
 TASK_PATTERNS = [
     (re.compile(r"\b(document|documentation|docs?)\b.{0,60}\b(workaround|example|behaviou?r|usage|how to)\b", re.I | re.S), "documentation"),
+    (re.compile(r"\b(should|could|need to|needs to|please|we can) document\b|\bdocument (this|these|it|the [a-z ]{0,30}) in [\w./-]+\.md\b", re.I), "documentation"),
     (re.compile(r"\b(add|write|missing)\b.{0,40}\b(regression |unit |integration )?tests?\b", re.I | re.S), "test"),
     (re.compile(r"\b(release|publish|ci|workflow|github actions?)\b.{0,50}\b(fix|broken|fail|repair|update)\b", re.I | re.S), "ci_release"),
     (re.compile(r"\b(typo|broken link|dead link|outdated)\b", re.I), "small_fix"),
@@ -171,7 +171,6 @@ def _load(state_dir: Path) -> dict:
     for key in ("repos", "checkpoints", "candidates", "shown", "runs"):
         state.setdefault(key, {} if key != "runs" else [])
     state.setdefault("rotation_cursor", 0)
-    state.setdefault("staged", {})
     return state
 
 
@@ -258,7 +257,12 @@ def _priority(c: dict) -> tuple:
 
 
 def _consider(state: dict, issue: dict, repo_name: str, now: dt.datetime) -> None:
-    if issue.get("pull_request") or issue.get("state") != "open":
+    if issue.get("pull_request"):
+        return
+    if issue.get("state") != "open":
+        c = state["candidates"].get(str(issue.get("id")))
+        if c:
+            c.update(status="closed", withheld_reasons=["not_open"], verified_at=_iso(now))
         return
     if _is_bot(issue):
         state["candidates"].pop(str(issue["id"]), None)
@@ -331,6 +335,114 @@ def _rotate(gh: GitHub, state: dict, now: dt.datetime, budget: int) -> list[str]
 
 # ---------------------------------------------------------------- verification
 
+ROLE_TTL_S = 7 * 24 * 3600
+ROLE_SECTIONS = re.compile(r"^(#{1,6})\s*(maintainers|approvers)\b[^\n]*$", re.I | re.M)
+HANDLE_RE = re.compile(r"github\.com/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))(?=[)/\s\"'>\]]|$)")
+DIRECTION_RE = re.compile(r"\b(pr|pull request|contribution)s?\b.{0,30}?\b(is|are|would be) (very )?(welcome|appreciated)|\bhappy to review\b|"
+                          r"\bfeel free to (open|send|submit|pick|take)\b|\bgo ahead\b|\bwould (accept|welcome)\b|"
+                          r"\bsounds good,? (please|go)\b|\bup for grabs\b|\bplease (open|send|submit) a (pr|pull request)\b", re.I)
+RELEASE_RE = re.compile(r"\b(not|no longer) (working|going to work) on (this|it)\b|\bunassign(ing)? (me|myself)\b|"
+                        r"\b(feel free|free) to take (this|it|over)\b|\bi('|’)?m (dropping|releasing) (this|it)\b", re.I)
+OPEN_FOR_OTHERS_RE = re.compile(r"\bup for grabs\b|\banyone (can|is welcome to) (take|pick)\b|\bfree to take\b|"
+                                r"\b(this|it) is (open|available) (again|for (anyone|others))\b", re.I)
+MAX_PAGES = 5
+MAX_LINKED_PRS = 5
+PENDING_TTL_S = 14 * 24 * 3600
+
+
+def _get_all(gh: GitHub, path: str, params: Optional[dict] = None) -> tuple[Optional[list], bool]:
+    """Every page of a list endpoint. Returns (items, complete); a 404/410 or page cap is incomplete."""
+    items, page = [], 1
+    while page <= MAX_PAGES:
+        rows = gh.get(path, {**(params or {}), "per_page": 100, "page": page})
+        if rows is None:
+            return (items or None), False
+        items.extend(rows)
+        if len(rows) < 100:
+            return items, True
+        page += 1
+    return items, False
+
+
+def _repo_roles(gh: GitHub, state: dict, repo: str, now: dt.datetime) -> Optional[dict]:
+    """Maintainers and approvers of one repo from its README (cached), or None when unknown."""
+    cache = state.setdefault("roles", {}).get(repo)
+    if cache and (now - _parse(cache["at"])).total_seconds() < ROLE_TTL_S:
+        return cache["handles"] or None
+    data = gh.get(f"/repos/{repo}/readme")
+    handles: dict = {}
+    if isinstance(data, dict) and data.get("content"):
+        import base64
+        text = base64.b64decode(data["content"]).decode("utf-8", "replace")
+        heads = list(re.finditer(r"^(#{1,6})\s*([^\n]*)$", text, re.M))
+        for i, h in enumerate(heads):
+            m = ROLE_SECTIONS.match(h.group(0))
+            if not m:
+                continue
+            level, end = len(m.group(1)), len(text)
+            for nxt in heads[i + 1:]:
+                if len(nxt.group(1)) <= level or "emeritus" in nxt.group(2).lower():
+                    end = nxt.start()
+                    break
+            for handle in HANDLE_RE.findall(text[h.end():end]):
+                handles.setdefault(handle.lower(), m.group(2).lower().rstrip("s"))
+    state["roles"][repo] = {"at": _iso(now), "handles": handles,
+                            "source": f"https://github.com/{repo}#readme"}
+    return handles or None
+
+
+def _claims(comments: list) -> list[dict]:
+    """Unresolved work claims by anyone (maintainers included). Age alone never resolves a claim."""
+    open_claims: dict = {}
+    for cm in comments:
+        login = ((cm.get("user") or {}).get("login") or "").lower()
+        body = cm.get("body") or ""
+        if CLAIM_RE.search(body):
+            open_claims[login] = {"by": login, "url": cm.get("html_url"), "at": cm.get("created_at")}
+        if RELEASE_RE.search(body):
+            open_claims.pop(login, None)
+        if OPEN_FOR_OTHERS_RE.search(body) and cm.get("author_association") in MAINTAINER_ASSOC:
+            open_claims.clear()
+    return list(open_claims.values())
+
+
+def _linked_prs(gh: GitHub, repo: str, num: int, timeline: list) -> tuple[list[dict], bool]:
+    """Every PR that references the issue: timeline cross-references, connections and a direct PR search."""
+    refs: dict = {}
+    for ev in timeline:
+        src = (ev.get("source") or {}).get("issue") or {}
+        if ev.get("event") == "cross-referenced" and src.get("pull_request") is not None:
+            prepo = (src.get("repository_url") or f"/repos/{repo}").split("/repos/")[-1]
+            refs[(prepo, src.get("number"))] = src.get("html_url")
+        elif ev.get("event") == "connected":
+            refs.setdefault(("?connected", 0), None)
+    complete = True
+    found = gh.get("/search/issues", {"q": f"repo:{repo} is:pr {num} in:body,title", "per_page": 30}, search=True)
+    if found is None:
+        complete = False
+    else:
+        pat = re.compile(rf"(#{num}\b|/issues/{num}\b)")
+        for it in found.get("items", []):
+            if pat.search(f"{it.get('title', '')} {it.get('body') or ''}"):
+                refs[(repo, it["number"])] = it.get("html_url")
+        if found.get("incomplete_results"):
+            complete = False
+    prs = []
+    if ("?connected", 0) in refs:
+        refs.pop(("?connected", 0))
+        prs.append({"state": "connected", "url": None})
+    for (prepo, pnum), url in list(refs.items())[:MAX_LINKED_PRS]:
+        pr = gh.get(f"/repos/{prepo}/pulls/{pnum}")
+        if pr is None:
+            complete = False
+            continue
+        prs.append({"repo": prepo, "number": pnum, "url": pr.get("html_url") or url, "state": pr.get("state"),
+                    "merged": bool(pr.get("merged_at")), "closed_at": pr.get("closed_at")})
+    if len(refs) > MAX_LINKED_PRS:
+        complete = False
+    return prs, complete
+
+
 def _withhold_without_calls(c: dict, now: dt.datetime) -> bool:
     """An issue already assigned in the listing is unavailable; record it without spending API calls."""
     if not c.get("assignees"):
@@ -342,51 +454,73 @@ def _withhold_without_calls(c: dict, now: dt.datetime) -> bool:
 
 
 def _verify(gh: GitHub, state: dict, key: str, now: dt.datetime) -> None:
+    """Full current verification of one candidate. Anything unconfirmed withholds the lead."""
     c = state["candidates"][key]
     if _withhold_without_calls(c, now):
         return
     repo, num = c["repo"], c["number"]
-    comments = gh.get(f"/repos/{repo}/issues/{num}/comments", {"per_page": 100}) or []
-    timeline = gh.get(f"/repos/{repo}/issues/{num}/timeline", {"per_page": 100}) or []
     reasons, evidence = [], []
-    if c.get("assignees"):
-        reasons.append("assigned")
-    direction = c.get("author_association") in MAINTAINER_ASSOC
-    if direction:
-        evidence.append({"kind": "maintainer_issue", "url": c["url"]})
-    cutoff = now - dt.timedelta(days=CLAIM_WINDOW_DAYS)
-    for cm in comments:
-        assoc = cm.get("author_association")
-        if assoc in MAINTAINER_ASSOC:
-            direction = True
-            evidence.append({"kind": "maintainer_comment", "url": cm.get("html_url"), "excerpt": (cm.get("body") or "")[:240]})
-        elif CLAIM_RE.search(cm.get("body") or "") and (_parse(cm.get("created_at")) or now) >= cutoff:
-            reasons.append("claimed_in_comments")
-    for ev in timeline:
-        if ev.get("event") == "cross-referenced":
-            src = (ev.get("source") or {}).get("issue") or {}
-            if not src.get("pull_request"):
-                continue
-            pr = src.get("pull_request") or {}
-            if pr.get("merged_at"):
-                reasons.append("fixed_by_merged_pr")
-            elif src.get("state") == "open":
-                reasons.append("open_pr")
-            else:
-                closed = _parse(src.get("closed_at"))
-                if closed and (now - closed).days < ABANDONED_PR_DAYS:
-                    reasons.append("recently_closed_pr")
-            evidence.append({"kind": "linked_pr", "url": src.get("html_url"), "state": src.get("state"),
-                             "merged": bool(pr.get("merged_at"))})
-        elif ev.get("event") in ("assigned", "connected"):
-            if ev.get("event") == "connected":
-                reasons.append("connected_pr")
-    if len(comments) >= 100 or len(timeline) >= 100:
-        reasons.append("incomplete_pagination")
-    if not direction:
-        reasons.append("no_maintainer_direction")
+    issue = gh.get(f"/repos/{repo}/issues/{num}")
+    if issue is None:
+        reasons.append("issue_unavailable")
+    elif issue.get("state") != "open" or issue.get("pull_request"):
+        c.update(status="closed", verified_at=_iso(now), withheld_reasons=["not_open"])
+        c["fingerprint"] = _fingerprint(c)
+        return
+    else:
+        c.update(title=issue.get("title", "")[:200], issue_updated=issue.get("updated_at"),
+                 assignees=[a.get("login") for a in issue.get("assignees") or []],
+                 author=((issue.get("user") or {}).get("login") or "").lower(),
+                 author_association=issue.get("author_association"),
+                 body_excerpt=(issue.get("body") or "")[:600],
+                 body_hash=hashlib.sha256((issue.get("body") or "").encode()).hexdigest()[:12])
+        if c["assignees"]:
+            reasons.append("assigned")
+    comments, ok_c = _get_all(gh, f"/repos/{repo}/issues/{num}/comments")
+    timeline, ok_t = _get_all(gh, f"/repos/{repo}/issues/{num}/timeline")
+    comments, timeline = comments or [], timeline or []
+    if not (ok_c and ok_t):
+        reasons.append("verification_incomplete")
+    roles = _repo_roles(gh, state, repo, now)
+    role_source = (state.get("roles", {}).get(repo) or {}).get("source")
+    if roles is None:
+        reasons.append("maintainer_roles_unavailable")
+    else:
+        if c.get("author") in roles and _signal({"title": c["title"], "body": c.get("body_excerpt"), "labels": []}):
+            evidence.append({"kind": "maintainer_issue", "url": c["url"], "by": c["author"],
+                             "role": roles[c["author"]], "role_source": role_source})
+        for cm in comments:
+            login = ((cm.get("user") or {}).get("login") or "").lower()
+            if login in roles and DIRECTION_RE.search(cm.get("body") or ""):
+                evidence.append({"kind": "maintainer_comment", "url": cm.get("html_url"), "by": login,
+                                 "role": roles[login], "role_source": role_source,
+                                 "excerpt": (cm.get("body") or "")[:240]})
+        if not any(e["kind"].startswith("maintainer") for e in evidence):
+            reasons.append("no_maintainer_direction")
+    for claim in _claims(comments):
+        reasons.append("claimed_in_comments")
+        evidence.append({"kind": "claim", "url": claim["url"], "by": claim["by"]})
+    prs, ok_p = _linked_prs(gh, repo, num, timeline)
+    if not ok_p:
+        reasons.append("verification_incomplete")
+    for pr in prs:
+        if pr["state"] == "connected":
+            reasons.append("connected_pr")
+            continue
+        if pr["merged"]:
+            reasons.append("fixed_by_merged_pr")
+        elif pr["state"] == "open":
+            reasons.append("open_pr")
+        else:
+            closed = _parse(pr.get("closed_at"))
+            if closed and (now - closed).days < ABANDONED_PR_DAYS:
+                reasons.append("recently_closed_pr")
+        evidence.append({"kind": "linked_pr", "url": pr["url"], "state": pr["state"], "merged": pr["merged"]})
+    if repo not in {state["repos"][r]["name"] for r in _eligible(state)}:
+        reasons.append("repo_not_eligible")
     c["evidence"] = evidence
     c["verified_at"] = _iso(now)
+    c["verified_run"] = state.get("run_id")
     c["verified_issue_updated"] = c.get("issue_updated")
     c["withheld_reasons"] = sorted(set(reasons))
     c["status"] = "withheld" if reasons else "verified"
@@ -395,6 +529,7 @@ def _verify(gh: GitHub, state: dict, key: str, now: dt.datetime) -> None:
 
 def _fingerprint(c: dict) -> str:
     material = {"title": c.get("title"), "kind": c.get("kind"), "assignees": c.get("assignees"),
+                "body": c.get("body_hash"),
                 "evidence": sorted((e.get("kind"), e.get("url"), e.get("state")) for e in c.get("evidence", []))}
     return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -406,10 +541,16 @@ def _needs_verify(c: dict, now: dt.datetime) -> bool:
     return c["status"] == "verified" and (not at or (now - at).total_seconds() > REVERIFY_AFTER_S)
 
 
+def _shown(state: dict, key: str) -> list:
+    v = state["shown"].get(key, [])
+    return [v] if isinstance(v, str) else list(v)          # migrate the earlier single-fingerprint format
+
+
 def _card(c: dict) -> dict:
     return {"repo": c["repo"], "number": c["number"], "title": c["title"], "url": c["url"], "kind": c["kind"],
             "requested_change": c.get("body_excerpt", "")[:280],
-            "why_available": "No assignee, no open or merged linked PR, no recent claim; maintainer direction present.",
+            "why_available": "Open and unassigned now, no open, merged or recently closed linked PR, no unresolved claim; "
+                             "direction from a listed maintainer or approver.",
             "next_step": {"documentation": "Draft the doc/example change described in the issue and open a PR.",
                           "test": "Add the regression test described in the issue and open a PR.",
                           "ci_release": "Reproduce the CI/release failure and propose the fix.",
@@ -423,18 +564,29 @@ def _card(c: dict) -> dict:
 def collect(state_dir, now: dt.datetime, *, max_calls: int = 45, deadline_s: float = 120,
             token: Optional[str] = None, transport: Callable = _urllib_transport,
             clock: Callable = time.monotonic) -> dict:
+    """One bounded scan. Leads are re-verified in this run immediately before staging.
+
+    staged_ids are immutable revision IDs ("<issue id>:<fingerprint>"). A pending revision survives
+    later scans until mark_shown() acknowledges it or it expires, so a delayed receipt still
+    acknowledges exactly the revision that was sent.
+    """
     state_dir = Path(state_dir)
     now = now.astimezone(dt.timezone.utc)
     gh = GitHub(max_calls=max_calls, deadline_s=deadline_s, token=token, transport=transport, clock=clock)
     notes: list[str] = []
     with _locked(state_dir):
         state = _load(state_dir)
+        state.setdefault("pending", {})
+        state.setdefault("acks", {})
+        import uuid
+        state["run_id"] = uuid.uuid4().hex
         status = "ok"
         visited: list[str] = []
+        leads, staged = [], []
         try:
             _refresh_inventory(gh, state, now)
             rotation_budget = max(1, int(max_calls * ROTATION_SHARE))
-            verify_budget = max(2, int(max_calls * VERIFY_SHARE))
+            verify_budget = max(6, int(max_calls * VERIFY_SHARE))
             try:
                 _search_recent(gh, state, now)
             except BudgetExhausted:
@@ -448,7 +600,7 @@ def collect(state_dir, now: dt.datetime, *, max_calls: int = 45, deadline_s: flo
             for key in pending:
                 if _withhold_without_calls(state["candidates"][key], now):
                     continue
-                if gh.left() < 2:
+                if gh.left() < 6:
                     status = "partial"
                     notes.append(f"{len(pending)} candidate(s) waiting for verification")
                     break
@@ -465,42 +617,77 @@ def collect(state_dir, now: dt.datetime, *, max_calls: int = 45, deadline_s: flo
         eligible = _eligible(state)
         done = [r for r in eligible if state["checkpoints"].get(r, {}).get("last_full_pass")]
         initial_pass = bool(eligible) and len(done) == len(eligible)
-        leads, staged = [], []
-        if initial_pass:
-            for key, c in sorted(state["candidates"].items(), key=lambda kv: kv[1].get("verified_at") or "", reverse=True):
-                if c["status"] != "verified" or state["shown"].get(key) == c.get("fingerprint"):
-                    continue
-                leads.append(_card(c))
-                staged.append(key)
+        run_at = _iso(now)
+        if initial_pass and status != "unavailable":
+            ranked = sorted((k for k, c in state["candidates"].items()
+                             if c["status"] == "verified" and c.get("fingerprint") not in _shown(state, k)),
+                            key=lambda k: state["candidates"][k].get("verified_at") or "", reverse=True)
+            for key in ranked:
                 if len(leads) >= MAX_CARDS:
                     break
-        else:
+                c = state["candidates"][key]
+                if c.get("verified_run") != state["run_id"]:
+                    # Leads are staged only from a verification made in this run.
+                    try:
+                        if gh.left() < 6:
+                            raise BudgetExhausted
+                        _verify(gh, state, key, now)
+                    except (BudgetExhausted, GitHubUnavailable):
+                        notes.append("a verified lead is waiting for re-verification before it can be shown")
+                        status = "partial" if status == "ok" else status
+                        break
+                    if c["status"] != "verified" or c["fingerprint"] in _shown(state, key):
+                        continue
+                sid = f"{key}:{c['fingerprint']}"
+                state["pending"].setdefault(sid, {"key": key, "fingerprint": c["fingerprint"], "staged_at": run_at})
+                state["pending"][sid]["card"] = _card(c)
+                leads.append(_card(c))
+                staged.append(sid)
+        elif not initial_pass:
             notes.append("initial pass over all eligible repositories not yet complete; leads withheld")
-        state["staged"] = {k: state["candidates"][k]["fingerprint"] for k in staged}
+        for sid in [s for s, p in state["pending"].items()
+                    if (now - _parse(p["staged_at"])).total_seconds() > PENDING_TTL_S]:
+            state["pending"].pop(sid)
         coverage = {"repos_inventory": len(state["repos"]), "repos_eligible": len(eligible),
                     "repos_full_pass": len(done), "repos_pending_full_pass": len(eligible) - len(done),
                     "repos_scanned_this_run": len(visited),
                     "initial_pass_complete": initial_pass, "http_attempts": gh.calls,
                     "candidates": len(state["candidates"]),
                     "verified": sum(c["status"] == "verified" for c in state["candidates"].values()),
-                    "withheld": sum(c["status"] == "withheld" for c in state["candidates"].values())}
-        state["runs"].append({"at": _iso(now), "status": status, **coverage})
+                    "withheld": sum(c["status"] == "withheld" for c in state["candidates"].values()),
+                    "pending_revisions": len(state["pending"])}
+        state["runs"].append({"at": run_at, "status": status, **coverage})
         _save(state_dir, state)
     return {"status": status, "leads": leads, "coverage": coverage, "staged_ids": staged, "notes": notes}
 
 
-def mark_shown(state_dir, staged_ids, receipt_id: str) -> int:
-    """Record leads as shown after a confirmed send. Only staged leads with an unchanged fingerprint count."""
+def mark_shown(state_dir, staged_ids, receipt_id: str) -> dict:
+    """Acknowledge exactly the revisions a confirmed send contained.
+
+    Returns {"confirmed": [...], "already": [...], "unknown": [...]}. Replaying the same receipt is
+    idempotent ("already"). An unknown ID means the revision was never staged or has expired; the
+    caller should keep that receipt pending rather than assume it was recorded.
+    """
     state_dir = Path(state_dir)
+    out = {"confirmed": [], "already": [], "unknown": []}
     with _locked(state_dir):
         state = _load(state_dir)
-        n = 0
-        for key in staged_ids or []:
-            fp = state["staged"].get(key)
-            if fp and state["candidates"].get(key, {}).get("fingerprint") == fp:
-                state["shown"][key] = fp
-                state["candidates"][key]["shown_receipt"] = receipt_id
-                n += 1
-        state["staged"] = {k: v for k, v in state["staged"].items() if k not in set(staged_ids or [])}
+        state.setdefault("pending", {})
+        state.setdefault("acks", {})
+        for sid in staged_ids or []:
+            if sid in state["acks"]:
+                out["already"].append(sid)
+                continue
+            p = state["pending"].get(sid)
+            if not p:
+                out["unknown"].append(sid)
+                continue
+            shown = _shown(state, p["key"])
+            if p["fingerprint"] not in shown:
+                shown.append(p["fingerprint"])
+            state["shown"][p["key"]] = shown
+            state["acks"][sid] = {"receipt": receipt_id, "at": _iso(dt.datetime.now(dt.timezone.utc))}
+            state["pending"].pop(sid)
+            out["confirmed"].append(sid)
         _save(state_dir, state)
-    return n
+    return out
