@@ -59,8 +59,9 @@ REPOS = [repo(1, "opentelemetry-python"), repo(2, "opentelemetry-java", language
 
 class FakeGitHub:
     def __init__(self, repos, issues, *, comments=None, timelines=None, pulls=None, pr_search=None, readmes=None,
-                 fail=None, quota=5000, incomplete_search=False, missing=()):
+                 fail=None, quota=5000, incomplete_search=False, missing=(), files=None):
         self.repos, self.issues = repos, issues
+        self.files = files or {}
         self.comments, self.timelines = comments or {}, timelines or {}
         self.pulls, self.pr_search = pulls or {}, pr_search or {}
         self.readmes = README if readmes is None else readmes
@@ -80,8 +81,16 @@ class FakeGitHub:
         path, page = p.path, int(q.get("page", 1))
         if any(path.endswith(m) for m in self.missing):
             return ot._Response(404, {"message": "Not Found"}, h)
-        if path == "/orgs/open-telemetry/repos":
-            return ot._Response(200, self.repos[(page - 1) * 100: page * 100], h)
+        m = re.match(r"/orgs/([^/]+)/repos$", path)
+        if m:
+            rows = [r for r in self.repos if r["full_name"].startswith(m.group(1) + "/")]
+            return ot._Response(200, rows[(page - 1) * 100: page * 100], h)
+        m = re.match(r"/repos/([^/]+/[^/]+)/contents/(.+)$", path)
+        if m:
+            text = self.files.get((m.group(1), m.group(2)))
+            if text is None:
+                return ot._Response(404, {}, h)
+            return ot._Response(200, {"content": base64.b64encode(text.encode()).decode()}, h)
         if path == "/search/issues":
             h["X-RateLimit-Resource"] = "search"
             if "is:pr" in q["q"]:
@@ -349,3 +358,72 @@ def test_unavailable_vs_partial(tmp_path):
 def test_state_file_is_private(tmp_path):
     run(tmp_path, FakeGitHub(REPOS, [REAL_5139]))
     assert oct((tmp_path / ot.STATE_FILE).stat().st_mode & 0o777) == "0o600"
+
+
+# ---------------------------------------------------------------- Grafana
+
+GRAFANA = "grafana/loki"
+G_REPOS = REPOS + [{"id": 70, "full_name": GRAFANA, "archived": False, "has_issues": True, "language": "Go",
+                    "open_issues_count": 1},
+                   {"id": 71, "full_name": "grafana/k6", "archived": False, "has_issues": True, "language": "Go",
+                    "open_issues_count": 1}]
+G_FILES = {(GRAFANA, "MAINTAINERS.md"): "@slim-bean is the main/default maintainer.\n\n"
+                                       "- `@grafana/docs-logs`, which includes [@knylander-grafana](https://github.com/knylander-grafana)\n"
+                                       "\n## Emeritus\n\n- @former-person\n",
+           ("grafana/k6", "CODEOWNERS"): "* @grafana/k6-core\n"}
+LOKI_DOC = issue(980, 15000, GRAFANA, "Docs: document retention workaround",
+                 "We should document the workaround for compactor retention in docs/operations.md.",
+                 author="slim-bean", assoc="MEMBER")
+K6_TEST = issue(981, 4000, "grafana/k6", "Add regression test for thresholds",
+                "Please add a regression test for threshold parsing.", author="core-dev", assoc="MEMBER")
+
+
+def test_grafana_roles_come_from_maintainers_files_not_teams(tmp_path):
+    out = run(tmp_path, FakeGitHub(G_REPOS, [LOKI_DOC, K6_TEST], files=G_FILES))
+    by = {(l["repo"], l["number"]): l for l in out["leads"]}
+    assert (GRAFANA, 15000) in by
+    ev = by[(GRAFANA, 15000)]["evidence"][0]
+    assert ev["by"] == "slim-bean" and ev["role_source"].endswith("MAINTAINERS.md")
+    roles = state(tmp_path)["roles"][GRAFANA]["handles"]
+    assert "knylander-grafana" in roles and "former-person" not in roles and "grafana" not in roles
+    assert "maintainer_roles_unavailable" in state(tmp_path)["candidates"]["981"]["withheld_reasons"]   # team-only k6
+
+
+def test_grafana_card_carries_the_cla_note_and_org(tmp_path):
+    out = run(tmp_path, FakeGitHub(G_REPOS, [LOKI_DOC], files=G_FILES))
+    card = [l for l in out["leads"] if l["repo"] == GRAFANA][0]
+    assert card["org"] == "grafana" and "CLA" in card["note"]
+
+
+def test_leads_alternate_between_organisations(tmp_path):
+    loki2 = issue(982, 15001, GRAFANA, "Docs: document another workaround",
+                  "We should document the workaround in docs/x.md.", author="slim-bean", assoc="MEMBER")
+    out = run(tmp_path, FakeGitHub(G_REPOS, [LOKI_DOC, loki2, REAL_5139], files=G_FILES,
+                                   timelines={5139: APRIL_TIMELINE}))
+    assert sorted(l["org"] for l in out["leads"]) == ["grafana", "open-telemetry"]
+
+
+def test_each_organisation_has_its_own_budget_and_coverage(tmp_path):
+    fake = FakeGitHub(G_REPOS, [LOKI_DOC], files=G_FILES)
+    out = run(tmp_path, fake, max_calls=12)
+    by = out["coverage"]["by_org"]
+    assert set(by) == {"open-telemetry", "grafana"}
+    assert all(v["http_attempts"] <= 12 for v in by.values())
+    assert by["grafana"]["repos_eligible"] == 2 and by["open-telemetry"]["repos_eligible"] == 2
+
+
+def test_single_org_state_migrates(tmp_path):
+    legacy = {"version": 1, "repos": {"1": {"name": PY, "archived": False, "has_issues": True}},
+              "checkpoints": {}, "candidates": {}, "shown": {}, "runs": [],
+              "rotation_cursor": 3, "recent_since": "2026-11-20T00:00:00Z", "inventory_complete": True}
+    (tmp_path / ot.STATE_FILE).write_text(json.dumps(legacy))
+    run(tmp_path, FakeGitHub(REPOS, []), orgs=("open-telemetry",))
+    st = state(tmp_path)
+    assert "rotation_cursor" not in st and st["org_state"]["open-telemetry"]["recent_since"]
+    assert st["repos"]["1"]["org"] == "open-telemetry"
+
+
+def test_per_org_call_budgets(tmp_path):
+    out = run(tmp_path, FakeGitHub(G_REPOS, [LOKI_DOC], files=G_FILES), max_calls={"open-telemetry": 8, "grafana": 20})
+    by = out["coverage"]["by_org"]
+    assert by["open-telemetry"]["http_attempts"] <= 8 and by["grafana"]["http_attempts"] <= 20

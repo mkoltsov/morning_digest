@@ -1,4 +1,4 @@
-# OpenTelemetry contribution tracker: integration notes
+# Contribution tracker (OpenTelemetry and Grafana): integration notes
 
 `otel_tracker.py` is self-contained: standard library only, read-only GitHub access, and private state in one JSON file. Tests are in `tests/test_otel_tracker.py` and use a fake GitHub transport with no network access.
 
@@ -6,7 +6,8 @@
 
 ```python
 import otel_tracker
-result = otel_tracker.collect(state_dir, now, max_calls=45, deadline_s=120, token=github_token)
+result = otel_tracker.collect(state_dir, now, max_calls={"open-telemetry": 45, "grafana": 120},
+                              deadline_s=120, token=github_token)  # orgs default to ("open-telemetry", "grafana")
 # result = {"status": "ok"|"partial"|"unavailable", "leads": [<=2 cards], "coverage": {...},
 #           "staged_ids": [...], "notes": [...]}
 # ...render result["leads"] before Automation Health, then after Gmail acceptance or Sent reconciliation:
@@ -33,6 +34,15 @@ From two live read-only runs, unauthenticated, 20 calls each:
 - **Speed:** each run took about 18 seconds.
 - **Noise:** bot issues (Renovate and Dependabot "Dependency Dashboard") are excluded. Assigned issues are withheld without spending API calls.
 - **Verification order:** candidates raised by a maintainer or with a help label are verified first.
+
+## Organisations
+
+- **Organisations scanned:** `open-telemetry` and `grafana` by default. Pass `orgs=` to change the list.
+- **Budgets and coverage:** each organisation has its own call budget (`max_calls` is an int or a per-org dict) and its own first-pass gate. Coverage is reported in `coverage["by_org"]`. Leads alternate between organisations, so one can't crowd out the other.
+- **OpenTelemetry roles:** the repo README's Maintainers and Approvers sections.
+- **Grafana roles:** individual @handles in `MAINTAINERS.md`, `GOVERNANCE.md` and `CODEOWNERS` (root, `.github/` or `docs/`), with Emeritus, Alumni and Former sections excluded. Team owners such as `@grafana/k6-core` can't be resolved publicly, so a team-only repo's leads are withheld as `maintainer_roles_unavailable`.
+- **Grafana card note:** Grafana cards carry `note`, which says that Grafana Labs projects ask for the CLA to be signed with your first PR.
+- **Grafana scale** (26 Nov 2026): 524 repos, of which 448 are eligible, with about 19,000 open issues. A first pass is about 640 issue-page reads. At 45 calls per run that's about 36 runs (18 days), so give Grafana about 120 calls per run (about 13 runs). That needs a token: unauthenticated access allows only 60 requests an hour, and the live check hit that limit.
 
 ## Revisions and receipts
 

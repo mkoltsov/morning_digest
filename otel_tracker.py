@@ -39,7 +39,9 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
-ORG = "open-telemetry"
+ORG = "open-telemetry"                   # kept for compatibility
+ORGS = ("open-telemetry", "grafana")      # organisations scanned by default, each with its own budget
+ORG_NOTES = {"grafana": "Grafana Labs projects ask for the CLA to be signed with your first PR."}
 API = "https://api.github.com"
 STATE_FILE = "otel_tracker_state.json"
 LOCK_FILE = ".otel_tracker.lock"
@@ -170,8 +172,20 @@ def _load(state_dir: Path) -> dict:
     state.setdefault("version", 1)
     for key in ("repos", "checkpoints", "candidates", "shown", "runs"):
         state.setdefault(key, {} if key != "runs" else [])
-    state.setdefault("rotation_cursor", 0)
+    org_state = state.setdefault("org_state", {})
+    legacy = {k: state.pop(k) for k in ("inventory_at", "inventory_complete", "inventory_next_page",
+                                        "inventory_seen", "recent_since", "rotation_cursor") if k in state}
+    if legacy:                                     # single-organisation state from before Grafana support
+        org_state.setdefault(ORG, {}).update(legacy)
+    for r in state["repos"].values():
+        r.setdefault("org", (r.get("name") or "").split("/")[0])
     return state
+
+
+def _ostate(state: dict, org: str) -> dict:
+    o = state["org_state"].setdefault(org, {})
+    o.setdefault("rotation_cursor", 0)
+    return o
 
 
 def _save(state_dir: Path, state: dict) -> None:
@@ -195,37 +209,39 @@ def _parse(s: Optional[str]) -> Optional[dt.datetime]:
 
 # ---------------------------------------------------------------- inventory
 
-def _refresh_inventory(gh: GitHub, state: dict, now: dt.datetime) -> bool:
-    """Page through the org's repos. Returns True when the inventory is complete."""
-    inv_at = _parse(state.get("inventory_at"))
-    if inv_at and (now - inv_at).total_seconds() < INVENTORY_TTL_S and state.get("inventory_complete"):
+def _refresh_inventory(gh: GitHub, state: dict, org: str, now: dt.datetime) -> bool:
+    """Page through one org's repos. Returns True when the inventory is complete."""
+    o = _ostate(state, org)
+    inv_at = _parse(o.get("inventory_at"))
+    if inv_at and (now - inv_at).total_seconds() < INVENTORY_TTL_S and o.get("inventory_complete"):
         return True
-    page = state.get("inventory_next_page", 1)
-    seen = set(state.get("inventory_seen", [])) if page > 1 else set()
+    page = o.get("inventory_next_page", 1)
+    seen = set(o.get("inventory_seen", [])) if page > 1 else set()
     while True:
-        rows = gh.get(f"/orgs/{ORG}/repos", {"type": "public", "per_page": 100, "page": page, "sort": "full_name"})
+        rows = gh.get(f"/orgs/{org}/repos", {"type": "public", "per_page": 100, "page": page, "sort": "full_name"})
         rows = rows or []
         for r in rows:
             rid = str(r["id"])
             seen.add(rid)
             entry = state["repos"].setdefault(rid, {})
-            entry.update(name=r["full_name"], archived=bool(r.get("archived")),
+            entry.update(name=r["full_name"], org=org, archived=bool(r.get("archived")),
                          has_issues=bool(r.get("has_issues", True)), language=r.get("language"),
                          open_issues=r.get("open_issues_count", 0))
-        state["inventory_next_page"], state["inventory_seen"] = page + 1, sorted(seen)
+        o["inventory_next_page"], o["inventory_seen"] = page + 1, sorted(seen)
         if len(rows) < 100:
             break
         page += 1
-    for rid in list(state["repos"]):
-        if rid not in seen:
-            state["repos"][rid]["removed"] = True
-    state.update(inventory_at=_iso(now), inventory_complete=True, inventory_next_page=1, inventory_seen=[])
+    for rid, r in state["repos"].items():
+        if r.get("org") == org and rid not in seen:
+            r["removed"] = True
+    o.update(inventory_at=_iso(now), inventory_complete=True, inventory_next_page=1, inventory_seen=[])
     return True
 
 
-def _eligible(state: dict) -> list[str]:
+def _eligible(state: dict, org: Optional[str] = None) -> list[str]:
     return sorted(rid for rid, r in state["repos"].items()
-                  if not r.get("archived") and r.get("has_issues") and not r.get("removed"))
+                  if not r.get("archived") and r.get("has_issues") and not r.get("removed")
+                  and (org is None or r.get("org") == org))
 
 
 # ---------------------------------------------------------------- discovery
@@ -282,11 +298,12 @@ def _consider(state: dict, issue: dict, repo_name: str, now: dt.datetime) -> Non
         c["status"] = "stale"
 
 
-def _search_recent(gh: GitHub, state: dict, now: dt.datetime) -> None:
-    since = _parse(state.get("recent_since")) or (now - dt.timedelta(days=14))
+def _search_recent(gh: GitHub, state: dict, org: str, now: dt.datetime) -> None:
+    o = _ostate(state, org)
+    since = _parse(o.get("recent_since")) or (now - dt.timedelta(days=14))
     since -= dt.timedelta(seconds=RECENT_WINDOW_OVERLAP_S)
     names = {r["name"]: r for r in state["repos"].values()}
-    q = f"org:{ORG} is:issue is:open updated:>={since.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+    q = f"org:{org} is:issue is:open updated:>={since.strftime('%Y-%m-%dT%H:%M:%SZ')}"
     page = 1
     while page <= 3:
         data = gh.get("/search/issues", {"q": q, "sort": "updated", "order": "desc", "per_page": 100, "page": page}, search=True)
@@ -297,19 +314,20 @@ def _search_recent(gh: GitHub, state: dict, now: dt.datetime) -> None:
             if repo_name in names and not names[repo_name].get("archived"):
                 _consider(state, it, repo_name, now)
         if len(data.get("items", [])) < 100:
-            state["recent_since"] = _iso(now)
+            o["recent_since"] = _iso(now)
             return
         page += 1
     gh.incomplete = True          # more than 300 recent updates: next run continues from the same window
 
 
-def _rotate(gh: GitHub, state: dict, now: dt.datetime, budget: int) -> list[str]:
-    """Scan quieter repos' open issues (oldest first after the checkpoint)."""
-    eligible = _eligible(state)
+def _rotate(gh: GitHub, state: dict, org: str, now: dt.datetime, budget: int) -> list[str]:
+    """Scan one org's repos' open issues (oldest first after each repo's checkpoint)."""
+    eligible = _eligible(state, org)
     if not eligible:
         return []
     visited = []
-    cursor = state["rotation_cursor"] % len(eligible)
+    o = _ostate(state, org)
+    cursor = o["rotation_cursor"] % len(eligible)
     for step in range(len(eligible)):
         if budget <= 0:
             break
@@ -329,7 +347,7 @@ def _rotate(gh: GitHub, state: dict, now: dt.datetime, budget: int) -> list[str]
             cp["next_page"] = params["page"] + 1
         cp["last_scan"] = _iso(now)
         visited.append(rid)
-        state["rotation_cursor"] = (cursor + step + 1) % len(eligible)
+        o["rotation_cursor"] = (cursor + step + 1) % len(eligible)
     return visited
 
 
@@ -364,11 +382,63 @@ def _get_all(gh: GitHub, path: str, params: Optional[dict] = None) -> tuple[Opti
     return items, False
 
 
+GRAFANA_ROLE_FILES = ("MAINTAINERS.md", "GOVERNANCE.md", "CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS")
+AT_HANDLE_RE = re.compile(r"(?<![\w/@.])@([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))(?![\w/-])")
+
+
+def _decode(data) -> Optional[str]:
+    import base64
+    if isinstance(data, dict) and data.get("content"):
+        return base64.b64decode(data["content"]).decode("utf-8", "replace")
+    return None
+
+
+def _without_emeritus(text: str) -> str:
+    """Drop Emeritus/Alumni/Former sections so past maintainers never count."""
+    out, skip, level = [], False, 0
+    for line in text.splitlines():
+        h = re.match(r"^(#{1,6})\s*(.*)$", line)
+        if h:
+            if skip and len(h.group(1)) <= level:
+                skip = False
+            if re.search(r"emeritus|alumni|former|past", h.group(2), re.I):
+                skip, level = True, len(h.group(1))
+        if not skip:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _grafana_roles(gh: GitHub, repo: str) -> tuple[dict, list]:
+    """Individual maintainers from MAINTAINERS.md, GOVERNANCE.md and CODEOWNERS.
+
+    Team owners such as @grafana/k6-core are skipped: their membership is not public, so a
+    repo owned only by teams has no verifiable individual maintainer."""
+    handles, sources = {}, []
+    for path in GRAFANA_ROLE_FILES:
+        text = _decode(gh.get(f"/repos/{repo}/contents/{path}"))
+        if not text:
+            continue
+        found = AT_HANDLE_RE.findall(_without_emeritus(text)) + HANDLE_RE.findall(_without_emeritus(text))
+        role = "codeowner" if path.endswith("CODEOWNERS") else "maintainer"
+        for handle in found:
+            if handle.lower() in ("grafana", "github"):
+                continue
+            handles.setdefault(handle.lower(), role)
+        if found:
+            sources.append(f"https://github.com/{repo}/blob/HEAD/{path}")
+    return handles, sources
+
+
 def _repo_roles(gh: GitHub, state: dict, repo: str, now: dt.datetime) -> Optional[dict]:
-    """Maintainers and approvers of one repo from its README (cached), or None when unknown."""
+    """Listed maintainers/approvers of one repo (cached), or None when no individual role is verifiable."""
     cache = state.setdefault("roles", {}).get(repo)
     if cache and (now - _parse(cache["at"])).total_seconds() < ROLE_TTL_S:
         return cache["handles"] or None
+    if repo.split("/")[0] == "grafana":
+        handles, sources = _grafana_roles(gh, repo)
+        state["roles"][repo] = {"at": _iso(now), "handles": handles,
+                                "source": sources[0] if sources else f"https://github.com/{repo}"}
+        return handles or None
     data = gh.get(f"/repos/{repo}/readme")
     handles: dict = {}
     if isinstance(data, dict) and data.get("content"):
@@ -547,7 +617,9 @@ def _shown(state: dict, key: str) -> list:
 
 
 def _card(c: dict) -> dict:
-    return {"repo": c["repo"], "number": c["number"], "title": c["title"], "url": c["url"], "kind": c["kind"],
+    org = c["repo"].split("/")[0]
+    return {"org": org, "note": ORG_NOTES.get(org),
+            "repo": c["repo"], "number": c["number"], "title": c["title"], "url": c["url"], "kind": c["kind"],
             "requested_change": c.get("body_excerpt", "")[:280],
             "why_available": "Open and unassigned now, no open, merged or recently closed linked PR, no unresolved claim; "
                              "direction from a listed maintainer or approver.",
@@ -561,81 +633,106 @@ def _card(c: dict) -> dict:
 
 # ---------------------------------------------------------------- public API
 
-def collect(state_dir, now: dt.datetime, *, max_calls: int = 45, deadline_s: float = 120,
+def collect(state_dir, now: dt.datetime, *, max_calls=45, deadline_s: float = 120,
             token: Optional[str] = None, transport: Callable = _urllib_transport,
-            clock: Callable = time.monotonic) -> dict:
-    """One bounded scan. Leads are re-verified in this run immediately before staging.
+            clock: Callable = time.monotonic, orgs=ORGS) -> dict:
+    """One bounded scan of each organisation. Leads are re-verified in this run immediately before staging.
 
-    staged_ids are immutable revision IDs ("<issue id>:<fingerprint>"). A pending revision survives
-    later scans until mark_shown() acknowledges it or it expires, so a delayed receipt still
-    acknowledges exactly the revision that was sent.
+    max_calls (an int, or {org: int}) applies to each organisation; deadline_s is shared between them. staged_ids are immutable
+    revision IDs ("<issue id>:<fingerprint>"). A pending revision survives later scans until
+    mark_shown() acknowledges it or it expires, so a delayed receipt still acknowledges exactly the
+    revision that was sent. Leads from an organisation appear only after its first full pass.
     """
+    import uuid
     state_dir = Path(state_dir)
     now = now.astimezone(dt.timezone.utc)
-    gh = GitHub(max_calls=max_calls, deadline_s=deadline_s, token=token, transport=transport, clock=clock)
+    orgs = tuple(orgs)
     notes: list[str] = []
+    started = clock()
     with _locked(state_dir):
         state = _load(state_dir)
         state.setdefault("pending", {})
         state.setdefault("acks", {})
-        import uuid
         state["run_id"] = uuid.uuid4().hex
-        status = "ok"
-        visited: list[str] = []
-        leads, staged = [], []
-        try:
-            _refresh_inventory(gh, state, now)
-            rotation_budget = max(1, int(max_calls * ROTATION_SHARE))
-            verify_budget = max(6, int(max_calls * VERIFY_SHARE))
-            try:
-                _search_recent(gh, state, now)
-            except BudgetExhausted:
-                status = "partial"
-            try:
-                visited = _rotate(gh, state, now, min(rotation_budget, max(0, gh.left() - verify_budget)))
-            except BudgetExhausted:
-                status = "partial"
-            pending = sorted((k for k, c in state["candidates"].items() if _needs_verify(c, now)),
-                             key=lambda k: _priority(state["candidates"][k]), reverse=True)
-            for key in pending:
-                if _withhold_without_calls(state["candidates"][key], now):
-                    continue
-                if gh.left() < 6:
-                    status = "partial"
-                    notes.append(f"{len(pending)} candidate(s) waiting for verification")
-                    break
-                _verify(gh, state, key, now)
-        except BudgetExhausted:
-            status = "partial"
-        except GitHubUnavailable as exc:
-            status = "unavailable" if gh.calls <= 1 else "partial"
-            notes.append(f"GitHub unavailable: {exc}")
-        if gh.incomplete and status == "ok":
-            status = "partial"
-            notes.append("GitHub returned incomplete or truncated results")
-
-        eligible = _eligible(state)
-        done = [r for r in eligible if state["checkpoints"].get(r, {}).get("last_full_pass")]
-        initial_pass = bool(eligible) and len(done) == len(eligible)
         run_at = _iso(now)
-        if initial_pass and status != "unavailable":
-            ranked = sorted((k for k, c in state["candidates"].items()
-                             if c["status"] == "verified" and c.get("fingerprint") not in _shown(state, k)),
-                            key=lambda k: state["candidates"][k].get("verified_at") or "", reverse=True)
-            for key in ranked:
+        per_org, clients = {}, {}
+        for i, org in enumerate(orgs):
+            remaining = deadline_s - (clock() - started)
+            share = max(1.0, remaining / (len(orgs) - i))
+            org_calls = max_calls.get(org, 45) if isinstance(max_calls, dict) else max_calls
+            gh = GitHub(max_calls=org_calls, deadline_s=share, token=token, transport=transport, clock=clock)
+            clients[org] = gh
+            status, visited, org_notes = "ok", [], []
+            try:
+                _refresh_inventory(gh, state, org, now)
+                rotation_budget = max(1, int(org_calls * ROTATION_SHARE))
+                verify_budget = max(6, int(org_calls * VERIFY_SHARE))
+                try:
+                    _search_recent(gh, state, org, now)
+                except BudgetExhausted:
+                    status = "partial"
+                try:
+                    visited = _rotate(gh, state, org, now, min(rotation_budget, max(0, gh.left() - verify_budget)))
+                except BudgetExhausted:
+                    status = "partial"
+                pending = sorted((k for k, c in state["candidates"].items()
+                                  if c["repo"].split("/")[0] == org and _needs_verify(c, now)),
+                                 key=lambda k: _priority(state["candidates"][k]), reverse=True)
+                for key in pending:
+                    if _withhold_without_calls(state["candidates"][key], now):
+                        continue
+                    if gh.left() < 6:
+                        status = "partial"
+                        org_notes.append(f"{len(pending)} candidate(s) waiting for verification")
+                        break
+                    _verify(gh, state, key, now)
+            except BudgetExhausted:
+                status = "partial"
+            except GitHubUnavailable as exc:
+                status = "unavailable" if gh.calls <= 1 else "partial"
+                org_notes.append(f"GitHub unavailable: {exc}")
+            if gh.incomplete and status == "ok":
+                status = "partial"
+                org_notes.append("GitHub returned incomplete or truncated results")
+            eligible = _eligible(state, org)
+            done = [r for r in eligible if state["checkpoints"].get(r, {}).get("last_full_pass")]
+            initial = bool(eligible) and len(done) == len(eligible)
+            if not initial:
+                org_notes.append("initial pass over all eligible repositories not yet complete; leads withheld")
+            per_org[org] = {"status": status, "repos_inventory": sum(r.get("org") == org for r in state["repos"].values()),
+                            "repos_eligible": len(eligible), "repos_full_pass": len(done),
+                            "repos_pending_full_pass": len(eligible) - len(done), "repos_scanned_this_run": len(visited),
+                            "initial_pass_complete": initial, "http_attempts": gh.calls}
+            notes += [f"{org}: {n}" for n in org_notes]
+
+        # Leads: re-verify in this run, then alternate between organisations so one cannot crowd out the other.
+        ranked = {org: sorted((k for k, c in state["candidates"].items()
+                               if c["repo"].split("/")[0] == org and c["status"] == "verified"
+                               and c.get("fingerprint") not in _shown(state, k)),
+                              key=lambda k: state["candidates"][k].get("verified_at") or "", reverse=True)
+                  for org in orgs if per_org[org]["initial_pass_complete"] and per_org[org]["status"] != "unavailable"}
+        leads, staged = [], []
+        while len(leads) < MAX_CARDS and any(ranked.values()):
+            for org in list(ranked):
                 if len(leads) >= MAX_CARDS:
                     break
+                if not ranked[org]:
+                    ranked.pop(org)
+                    continue
+                key = ranked[org].pop(0)
                 c = state["candidates"][key]
                 if c.get("verified_run") != state["run_id"]:
-                    # Leads are staged only from a verification made in this run.
+                    gh = clients[org]
                     try:
                         if gh.left() < 6:
                             raise BudgetExhausted
                         _verify(gh, state, key, now)
                     except (BudgetExhausted, GitHubUnavailable):
-                        notes.append("a verified lead is waiting for re-verification before it can be shown")
-                        status = "partial" if status == "ok" else status
-                        break
+                        notes.append(f"{org}: a verified lead is waiting for re-verification before it can be shown")
+                        if per_org[org]["status"] == "ok":
+                            per_org[org]["status"] = "partial"
+                        ranked.pop(org)
+                        continue
                     if c["status"] != "verified" or c["fingerprint"] in _shown(state, key):
                         continue
                 sid = f"{key}:{c['fingerprint']}"
@@ -643,20 +740,24 @@ def collect(state_dir, now: dt.datetime, *, max_calls: int = 45, deadline_s: flo
                 state["pending"][sid]["card"] = _card(c)
                 leads.append(_card(c))
                 staged.append(sid)
-        elif not initial_pass:
-            notes.append("initial pass over all eligible repositories not yet complete; leads withheld")
         for sid in [s for s, p in state["pending"].items()
                     if (now - _parse(p["staged_at"])).total_seconds() > PENDING_TTL_S]:
             state["pending"].pop(sid)
-        coverage = {"repos_inventory": len(state["repos"]), "repos_eligible": len(eligible),
-                    "repos_full_pass": len(done), "repos_pending_full_pass": len(eligible) - len(done),
-                    "repos_scanned_this_run": len(visited),
-                    "initial_pass_complete": initial_pass, "http_attempts": gh.calls,
-                    "candidates": len(state["candidates"]),
-                    "verified": sum(c["status"] == "verified" for c in state["candidates"].values()),
-                    "withheld": sum(c["status"] == "withheld" for c in state["candidates"].values()),
-                    "pending_revisions": len(state["pending"])}
-        state["runs"].append({"at": run_at, "status": status, **coverage})
+
+        statuses = [v["status"] for v in per_org.values()]
+        status = ("unavailable" if statuses and all(x == "unavailable" for x in statuses)
+                  else "ok" if all(x == "ok" for x in statuses) else "partial")
+        cands = state["candidates"].values()
+        coverage = {k: sum(v[k] for v in per_org.values())
+                    for k in ("repos_inventory", "repos_eligible", "repos_full_pass", "repos_pending_full_pass",
+                              "repos_scanned_this_run", "http_attempts")}
+        coverage.update(initial_pass_complete=all(v["initial_pass_complete"] for v in per_org.values()),
+                        candidates=len(state["candidates"]),
+                        verified=sum(c["status"] == "verified" for c in cands),
+                        withheld=sum(c["status"] == "withheld" for c in cands),
+                        pending_revisions=len(state["pending"]), by_org=per_org)
+        state["runs"].append({"at": run_at, "status": status,
+                              **{k: v for k, v in coverage.items() if k != "by_org"}})
         _save(state_dir, state)
     return {"status": status, "leads": leads, "coverage": coverage, "staged_ids": staged, "notes": notes}
 
