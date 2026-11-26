@@ -413,20 +413,22 @@ def _grafana_roles(gh: GitHub, repo: str) -> tuple[dict, list]:
 
     Team owners such as @grafana/k6-core are skipped: their membership is not public, so a
     repo owned only by teams has no verifiable individual maintainer."""
-    handles, sources = {}, []
+    handles, sources, handle_sources = {}, [], {}
     for path in GRAFANA_ROLE_FILES:
         text = _decode(gh.get(f"/repos/{repo}/contents/{path}"))
         if not text:
             continue
         found = AT_HANDLE_RE.findall(_without_emeritus(text)) + HANDLE_RE.findall(_without_emeritus(text))
         role = "codeowner" if path.endswith("CODEOWNERS") else "maintainer"
+        src = f"https://github.com/{repo}/blob/HEAD/{path}"
         for handle in found:
             if handle.lower() in ("grafana", "github"):
                 continue
+            handle_sources.setdefault(handle.lower(), src)
             handles.setdefault(handle.lower(), role)
         if found:
             sources.append(f"https://github.com/{repo}/blob/HEAD/{path}")
-    return handles, sources
+    return handles, sources, handle_sources
 
 
 def _repo_roles(gh: GitHub, state: dict, repo: str, now: dt.datetime) -> Optional[dict]:
@@ -435,8 +437,8 @@ def _repo_roles(gh: GitHub, state: dict, repo: str, now: dt.datetime) -> Optiona
     if cache and (now - _parse(cache["at"])).total_seconds() < ROLE_TTL_S:
         return cache["handles"] or None
     if repo.split("/")[0] == "grafana":
-        handles, sources = _grafana_roles(gh, repo)
-        state["roles"][repo] = {"at": _iso(now), "handles": handles,
+        handles, sources, handle_sources = _grafana_roles(gh, repo)
+        state["roles"][repo] = {"at": _iso(now), "handles": handles, "handle_sources": handle_sources,
                                 "source": sources[0] if sources else f"https://github.com/{repo}"}
         return handles or None
     data = gh.get(f"/repos/{repo}/readme")
@@ -552,18 +554,20 @@ def _verify(gh: GitHub, state: dict, key: str, now: dt.datetime) -> None:
     if not (ok_c and ok_t):
         reasons.append("verification_incomplete")
     roles = _repo_roles(gh, state, repo, now)
-    role_source = (state.get("roles", {}).get(repo) or {}).get("source")
+    role_info = state.get("roles", {}).get(repo) or {}
+    role_source = role_info.get("source")
+    source_of = lambda h: (role_info.get("handle_sources") or {}).get(h, role_source)
     if roles is None:
         reasons.append("maintainer_roles_unavailable")
     else:
         if c.get("author") in roles and _signal({"title": c["title"], "body": c.get("body_excerpt"), "labels": []}):
             evidence.append({"kind": "maintainer_issue", "url": c["url"], "by": c["author"],
-                             "role": roles[c["author"]], "role_source": role_source})
+                             "role": roles[c["author"]], "role_source": source_of(c["author"])})
         for cm in comments:
             login = ((cm.get("user") or {}).get("login") or "").lower()
             if login in roles and DIRECTION_RE.search(cm.get("body") or ""):
                 evidence.append({"kind": "maintainer_comment", "url": cm.get("html_url"), "by": login,
-                                 "role": roles[login], "role_source": role_source,
+                                 "role": roles[login], "role_source": source_of(login),
                                  "excerpt": (cm.get("body") or "")[:240]})
         if not any(e["kind"].startswith("maintainer") for e in evidence):
             reasons.append("no_maintainer_direction")
@@ -746,6 +750,8 @@ def collect(state_dir, now: dt.datetime, *, max_calls=45, deadline_s: float = 12
                     and (now - _parse(p.get("last_staged_at") or p["staged_at"])).total_seconds() > PENDING_TTL_S]:
             state["pending"].pop(sid)
 
+        for org, gh in clients.items():
+            per_org[org]["http_attempts"] = gh.calls          # includes re-checks made while staging leads
         statuses = [v["status"] for v in per_org.values()]
         status = ("unavailable" if statuses and all(x == "unavailable" for x in statuses)
                   else "ok" if all(x == "ok" for x in statuses) else "partial")

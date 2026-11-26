@@ -445,3 +445,21 @@ def test_pending_revision_not_offered_for_14_days_expires(tmp_path):
     gone = dict(REAL_5139, assignees=[{"login": "x"}], updated_at="2026-11-27T00:00:00Z")
     ot.collect(tmp_path, NOW + dt.timedelta(days=20), transport=FakeGitHub(REPOS, [gone]), max_calls=60)
     assert ot.mark_shown(tmp_path, [sid], "receipt")["unknown"] == [sid]
+
+
+def test_grafana_role_source_is_the_file_that_lists_the_handle(tmp_path):
+    files = dict(G_FILES)
+    files[(GRAFANA, "CODEOWNERS")] = "/docs/ @doc-owner\n"
+    doc = issue(983, 15002, GRAFANA, "Docs: document the setting", "We should document the setting in docs/x.md.",
+                author="doc-owner", assoc="MEMBER")
+    out = run(tmp_path, FakeGitHub(G_REPOS, [doc], files=files))
+    ev = [l for l in out["leads"] if l["number"] == 15002][0]["evidence"][0]
+    assert ev["role"] == "codeowner" and ev["role_source"].endswith("/CODEOWNERS")
+
+
+def test_http_attempts_include_staging_rechecks(tmp_path):
+    run(tmp_path, FakeGitHub(REPOS, [REAL_5139], timelines={5139: APRIL_TIMELINE}))
+    fake = FakeGitHub(REPOS, [REAL_5139], timelines={5139: APRIL_TIMELINE})
+    out = run(tmp_path, fake, orgs=("open-telemetry",))
+    assert out["coverage"]["by_org"]["open-telemetry"]["http_attempts"] == len(fake.urls)
+    assert out["coverage"]["http_attempts"] == len(fake.urls)
