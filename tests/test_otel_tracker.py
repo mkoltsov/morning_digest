@@ -427,3 +427,21 @@ def test_per_org_call_budgets(tmp_path):
     out = run(tmp_path, FakeGitHub(G_REPOS, [LOKI_DOC], files=G_FILES), max_calls={"open-telemetry": 8, "grafana": 20})
     by = out["coverage"]["by_org"]
     assert by["open-telemetry"]["http_attempts"] <= 8 and by["grafana"]["http_attempts"] <= 20
+
+
+def test_old_unchanged_revision_restaged_today_does_not_expire_in_the_same_scan(tmp_path):
+    first = run(tmp_path, FakeGitHub(REPOS, [REAL_5139], timelines={5139: APRIL_TIMELINE}))
+    sid = first["staged_ids"][0]
+    later = NOW + dt.timedelta(days=20)
+    out = ot.collect(tmp_path, later, transport=FakeGitHub(REPOS, [REAL_5139], timelines={5139: APRIL_TIMELINE}),
+                     max_calls=60)
+    assert out["staged_ids"] == [sid]
+    assert ot.mark_shown(tmp_path, [sid], "receipt")["confirmed"] == [sid]
+
+
+def test_pending_revision_not_offered_for_14_days_expires(tmp_path):
+    first = run(tmp_path, FakeGitHub(REPOS, [REAL_5139], timelines={5139: APRIL_TIMELINE}))
+    sid = first["staged_ids"][0]
+    gone = dict(REAL_5139, assignees=[{"login": "x"}], updated_at="2026-11-27T00:00:00Z")
+    ot.collect(tmp_path, NOW + dt.timedelta(days=20), transport=FakeGitHub(REPOS, [gone]), max_calls=60)
+    assert ot.mark_shown(tmp_path, [sid], "receipt")["unknown"] == [sid]

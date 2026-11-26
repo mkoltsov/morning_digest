@@ -738,10 +738,12 @@ def collect(state_dir, now: dt.datetime, *, max_calls=45, deadline_s: float = 12
                 sid = f"{key}:{c['fingerprint']}"
                 state["pending"].setdefault(sid, {"key": key, "fingerprint": c["fingerprint"], "staged_at": run_at})
                 state["pending"][sid]["card"] = _card(c)
+                state["pending"][sid]["last_staged_at"] = run_at      # expiry counts from the latest offer
                 leads.append(_card(c))
                 staged.append(sid)
         for sid in [s for s, p in state["pending"].items()
-                    if (now - _parse(p["staged_at"])).total_seconds() > PENDING_TTL_S]:
+                    if s not in staged
+                    and (now - _parse(p.get("last_staged_at") or p["staged_at"])).total_seconds() > PENDING_TTL_S]:
             state["pending"].pop(sid)
 
         statuses = [v["status"] for v in per_org.values()]

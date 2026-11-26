@@ -47,7 +47,7 @@ From two live read-only runs, unauthenticated, 20 calls each:
 ## Revisions and receipts
 
 - **Staging IDs:** `staged_ids` are immutable revision IDs, `<issue id>:<fingerprint>`.
-- **Pending revisions:** a pending revision survives later scans until `mark_shown()` acknowledges it, or for 14 days. A late receipt for revision A therefore acknowledges only A, even if revision B is current or the issue has since been withheld.
+- **Pending revisions:** a pending revision survives later scans until `mark_shown()` acknowledges it, or until 14 days pass without it being offered again. A revision staged in a scan never expires in that same scan. A late receipt for revision A therefore acknowledges only A, even if revision B is current or the issue has since been withheld.
 - **Replays:** replaying a receipt is idempotent and returns its IDs under `already`.
 
 ## Verification rules (a lead is withheld for any of these)
